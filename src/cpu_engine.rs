@@ -203,14 +203,23 @@ pub fn embed_lookup(table: &CpuWeight, ids: &[i64]) -> CpuTensor {
     CpuTensor::new(out, vec![n, d])
 }
 
-/// Argmax of a flat slice.
+/// Argmax of a flat slice.  Chunked rayon reduce (par_iter().max_by() has surprising
+/// overhead per element on small types).
 pub fn argmax(x: &[f32]) -> i32 {
-    // Rayon reduce: find max + its index.  For vocab~152k this is cheap.
-    let (idx, _) = x
+    const CHUNK: usize = 4096;
+    let n = x.len();
+    let (idx, _) = (0..n).step_by(CHUNK).collect::<Vec<_>>()
         .par_iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .unwrap();
+        .map(|&start| {
+            let end = (start + CHUNK).min(n);
+            let mut best_idx = start;
+            let mut best_val = x[start];
+            for i in (start + 1)..end {
+                if x[i] > best_val { best_val = x[i]; best_idx = i; }
+            }
+            (best_idx, best_val)
+        })
+        .reduce(|| (0usize, f32::NEG_INFINITY), |a, b| if b.1 > a.1 { b } else { a });
     idx as i32
 }
 
