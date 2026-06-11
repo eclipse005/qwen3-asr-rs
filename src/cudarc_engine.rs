@@ -1156,10 +1156,12 @@ impl GpuDecoderLayer {
         let attn_out = if s == 1 {
             let scale = 1.0f32 / (self.hd as f32).sqrt();
             const SPLIT_THRESHOLD: usize = 1024;
-            const CHUNK_SIZE: usize = 512;
+            // Adaptive chunk: smaller chunks = more parallelism but more merge overhead.
+            // Empirically (P104, sm_61): 256 sweet spot until ~2048, then 512 wins on long ctx.
+            let chunk_size: usize = if cur_len >= 2048 { 512 } else { 256 };
             if cur_len > SPLIT_THRESHOLD {
                 cuda.fused_gqa_decode_split(&q, &kv.k[layer_idx], &kv.v[layer_idx],
-                    self.nkvh, kv.max_seq, cur_len, scale, CHUNK_SIZE)?
+                    self.nkvh, kv.max_seq, cur_len, scale, chunk_size)?
                     .reshape(vec![b, self.nqh, 1, self.hd])
             } else {
                 cuda.fused_gqa_decode(&q, &kv.k[layer_idx], &kv.v[layer_idx],
