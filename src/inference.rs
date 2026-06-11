@@ -340,6 +340,7 @@ impl AsrInferenceInner {
         let mut next_token = cuda.argmax(&logits)? as i64;
 
         // ── Decode loop ──
+        let t_decode = std::time::Instant::now();
         for _step in 0..max_new_tokens {
             if eos_ids.contains(&next_token) { break; }
             generated_ids.push(next_token as u32);
@@ -351,6 +352,10 @@ impl AsrInferenceInner {
             current_pos += 1;
         }
         cuda.synchronize()?;
+        let n_gen = generated_ids.len().max(1);
+        info!("Decode: {:.2}ms total ({} tokens, {:.2}ms/tok)",
+              t_decode.elapsed().as_secs_f64() * 1000.0, n_gen,
+              t_decode.elapsed().as_secs_f64() * 1000.0 / n_gen as f64);
 
         info!("Generated {} tokens", generated_ids.len());
         Ok(generated_ids)

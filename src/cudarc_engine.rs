@@ -202,6 +202,10 @@ impl CudaState {
     pub fn alloc_zeros_i32(&self, n: usize) -> Result<CudaSlice<i32>> {
         Ok(self.stream.alloc_zeros::<i32>(n)?)
     }
+    /// Allocate uninitialized i32 — same semantics as `alloc_uninit_f16`.
+    pub fn alloc_uninit_i32(&self, n: usize) -> Result<CudaSlice<i32>> {
+        Ok(unsafe { self.stream.alloc::<i32>(n)? })
+    }
     pub fn download_f16(&self, slice: &CudaSlice<f16>) -> Result<Vec<f16>> {
         Ok(self.stream.clone_dtoh(slice)?)
     }
@@ -551,7 +555,7 @@ impl CudaState {
 
     pub fn argmax(&self, x: &GpuTensor) -> Result<i32> {
         let n = x.numel();
-        let mut out = self.alloc_zeros_i32(1)?;
+        let mut out = self.alloc_uninit_i32(1)?;
         let cfg = LaunchConfig {
             grid_dim: (1, 1, 1),
             block_dim: (1024, 1, 1),
@@ -573,7 +577,7 @@ impl CudaState {
         let hs = embed_table.cols;
         let vocab = embed_table.rows;
         assert!(hidden.numel() >= hs, "lm_head_argmax: hidden too small");
-        let mut out = self.alloc_zeros_i32(1)?;
+        let mut out = self.alloc_uninit_i32(1)?;
         let cfg = LaunchConfig {
             grid_dim: (1, 1, 1),
             block_dim: (1024, 1, 1),
@@ -1090,16 +1094,17 @@ impl GpuDecoderLayer {
         })
     }
 
-    /// x: [b, s, hs]  (always GPU)
+    /// x: [b, s, hs]  (always GPU, consumed — reused as the residual stream so we
+    /// don't allocate+memcpy a clone before the O-proj accumulation).
     /// cos/sin: [s, d]  device-resident slice for the positions of this call
-    fn forward(&self, x: &GpuTensor, cos: &CudaSlice<f16>, sin: &CudaSlice<f16>,
+    fn forward(&self, x: GpuTensor, cos: &CudaSlice<f16>, sin: &CudaSlice<f16>,
                kv: &mut GpuKvCache, layer_idx: usize, kv_start: usize, use_causal: bool,
                cuda: &CudaState) -> Result<GpuTensor>
     {
         let b = x.shape()[0]; let s = x.shape()[1];
 
         // 1. Input RMSNorm
-        let normed = cuda.rms_norm(x, &self.iln_w, self.eps)?;
+        let normed = cuda.rms_norm(&x, &self.iln_w, self.eps)?;
 
         // 2. Fused QKV projection
         let qkv = cuda.linear_gpu(&normed, &self.qkv_w)?;
@@ -1160,7 +1165,7 @@ impl GpuDecoderLayer {
             cuda.swap_dims_12(&attn_out)?.reshape(vec![b, s, self.nqh * self.hd])
         };
         // h = x.clone() then h += attn_flat @ O^T   (cuBLAS beta=1)
-        let mut h = cuda.clone_tensor(x)?;
+        let mut h = x;
         cuda.linear_gpu_accum(&mut h, &attn_flat, &self.o_w)?;
         drop(attn_flat);
 
@@ -1229,7 +1234,7 @@ impl GpuTextDecoder {
         let sl = hs.shape()[1];
         let mut h = hs;
         for (i, layer) in self.layers.iter().enumerate() {
-            h = layer.forward(&h, cos, sin, kv, i, kv_start, use_causal, &self.cuda)?;
+            h = layer.forward(h, cos, sin, kv, i, kv_start, use_causal, &self.cuda)?;
         }
         kv.cur_len = kv_start + sl;
 
@@ -1257,7 +1262,7 @@ impl GpuTextDecoder {
         let sl = hs.shape()[1];
         let mut h = hs;
         for (i, layer) in self.layers.iter().enumerate() {
-            h = layer.forward(&h, cos, sin, kv, i, kv_start, false, &self.cuda)?;
+            h = layer.forward(h, cos, sin, kv, i, kv_start, false, &self.cuda)?;
         }
         kv.cur_len = kv_start + sl;
 

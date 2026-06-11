@@ -21,16 +21,16 @@
 
 | 音频 | 起点 | **现在 RTFx** | candle CUDA |
 |------|-----|-----|-----|
-| 15s 英文 | 0.44x | **23.03x** ✅ | ~7.5x |
-| 30s 中文 | 0.25x | **19.93x** ✅ | ~7.5x |
-| 90s 英文 | — | **17.85x** ✅ | — |
-| 90s 日文 | — | **19.20x** ✅ | — |
-| 180s 英文 | — | **16.76x** ✅ | — |
-| 180s 中文 | — | **15.47x** | — |
+| 15s 英文 | 0.44x | **23.50x** ✅ | ~7.5x |
+| 30s 中文 | 0.25x | **20.32x** ✅ | ~7.5x |
+| 90s 英文 | — | **18.00x** ✅ | — |
+| 90s 日文 | — | **19.53x** ✅ | — |
+| 180s 英文 | — | **16.92x** ✅ | — |
+| 180s 中文 | — | **15.62x** | — |
 | 1.7B-15s | — | 11.37x | — |
 | 1.7B-30s | — | 10.05x | — |
 
-> **关键拐点**：从 0.25x → 19.93x 是约 **80x 提速**，0.6B 全部测试 ≥ 15x。
+> **关键拐点**：从 0.25x → 20.32x 是约 **80x 提速**，0.6B 全部测试 ≥ 15x。
 
 ---
 
@@ -265,6 +265,7 @@ Remove-Item D:\qwen3-asr-burn\target\autotune -Recurse -Force
 | skip swap_dims_12 on s=1 (no-op) | 11.39x | 8.40x | 7.32x | s=1 时 swap [b,h,1,d]→[b,1,h,d] 是 no-op |
 | **fused_gqa_decode_split (flash-attn 2-kernel)** | **12.55x** | **10.19x** | **10.69x** | 长 context decode 跨 block 并行 + online-softmax 合并 |
 | **alloc_uninit_f16 (skip memset_d8_async)** | **23.03x** | **19.93x** | **16.76x** | 用 `stream.alloc::<f16>` 替代 `alloc_zeros`，每个 cuBLAS/kernel output 省一次 memset launch；Pascal+Windows 下 driver enqueue 限速 → 80% 节省 |
+| **skip clone_tensor at O-proj** | **23.50x** | **20.32x** | **16.92x** | layer.forward 改成按值消费 x，直接复用 x 当 residual buffer，省 28 × N_step 个 memcpy_dtod launch |
 
 ---
 
