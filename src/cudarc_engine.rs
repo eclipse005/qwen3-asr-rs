@@ -103,6 +103,7 @@ pub(crate) struct CudaKernels {
     pub qkv_split: CudaFunction,
     pub qkv_extract_q_norm_rotary: CudaFunction,
     pub qkv_extract_kv_norm_rotary_cache: CudaFunction,
+    pub qkv_extract_qkv_norm_rotary_cache: CudaFunction,
     pub kv_cache_write: CudaFunction,
     pub kv_cache_write_pair: CudaFunction,
     pub gelu: CudaFunction,
@@ -170,6 +171,7 @@ impl CudaState {
             qkv_split: module.load_function("qkv_split_f16")?,
             qkv_extract_q_norm_rotary: module.load_function("qkv_extract_q_norm_rotary_f16")?,
             qkv_extract_kv_norm_rotary_cache: module.load_function("qkv_extract_kv_norm_rotary_cache_f16")?,
+            qkv_extract_qkv_norm_rotary_cache: module.load_function("qkv_extract_qkv_norm_rotary_cache_f16")?,
             kv_cache_write: module.load_function("kv_cache_write_f16")?,
             kv_cache_write_pair: module.load_function("kv_cache_write_pair_f16")?,
             gelu: module.load_function("gelu_f16")?,
@@ -701,6 +703,40 @@ impl CudaState {
         Ok(())
     }
 
+    /// Single-kernel fused QKV extraction: builds Q, K (with norm+rotary) and V (raw),
+    /// writes Q to a fresh output and K/V into their respective caches.
+    /// Replaces qkv_extract_q_norm_rotary + qkv_extract_kv_norm_rotary_cache (2 launches → 1).
+    pub fn qkv_extract_qkv_norm_rotary_cache(&self,
+        k_cache: &mut CudaSlice<f16>, v_cache: &mut CudaSlice<f16>,
+        qkv: &GpuTensor, qn_w: &CudaSlice<f16>, kn_w: &CudaSlice<f16>,
+        cos: &CudaSlice<f16>, sin: &CudaSlice<f16>,
+        nqh: usize, nkvh: usize, d: usize, q_dim: usize, kv_dim: usize,
+        max_seq: usize, start: usize, pos_offset: usize, eps: f32,
+    ) -> Result<GpuTensor> {
+        let s = qkv.shape();
+        assert_eq!(s.len(), 3);
+        let (b, sl, total_cols) = (s[0], s[1], s[2]);
+        let mut q_out = self.alloc_uninit_f16(b * nqh * sl * d)?;
+        let bs = block_for_reduction(d);
+        let cfg = LaunchConfig {
+            grid_dim: ((b * sl) as u32, (nqh + nkvh) as u32, 1),
+            block_dim: (bs, 1, 1),
+            shared_mem_bytes: bs * 4,
+        };
+        let b_i = b as i32; let nqh_i = nqh as i32; let nkvh_i = nkvh as i32;
+        let sl_i = sl as i32; let d_i = d as i32; let tot_i = total_cols as i32;
+        let q_i = q_dim as i32; let kv_i = kv_dim as i32;
+        let max_i = max_seq as i32; let start_i = start as i32; let po = pos_offset as i32;
+        let mut bb = self.stream.launch_builder(&self.k.qkv_extract_qkv_norm_rotary_cache);
+        bb.arg(&mut q_out); bb.arg(k_cache); bb.arg(v_cache); bb.arg(&qkv.data);
+        bb.arg(qn_w); bb.arg(kn_w); bb.arg(cos); bb.arg(sin);
+        bb.arg(&b_i); bb.arg(&nqh_i); bb.arg(&nkvh_i); bb.arg(&sl_i); bb.arg(&d_i); bb.arg(&tot_i);
+        bb.arg(&q_i); bb.arg(&kv_i);
+        bb.arg(&max_i); bb.arg(&start_i); bb.arg(&po); bb.arg(&eps);
+        unsafe { bb.launch(cfg) }?;
+        Ok(GpuTensor::new(q_out, vec![b, nqh, sl, d]))
+    }
+
     /// Write a [b, nkvh, s_new, d] tensor into a [b, nkvh, max_seq, d] cache at offset `start`.
     pub fn kv_cache_write(&self, cache: &mut CudaSlice<f16>, k_new: &GpuTensor,
         b: usize, nkvh: usize, max_seq: usize, d: usize, start: usize,
@@ -1131,17 +1167,12 @@ impl GpuDecoderLayer {
         let q_dim = self.nqh * self.hd;
         let kv_dim = self.nkvh * self.hd;
 
-        // 3+4+5. Fused QKV processing:
-        //   - Q: extract from QKV + RMSNorm + rotary  (1 launch)
-        //   - K + V: extract from QKV + (K: norm + rotary) + write both to cache  (1 launch)
-        // Replaces qkv_split×3 + rms_norm_rotary×2 + kv_cache_write_pair (6 launches → 2).
-        let q = cuda.qkv_extract_q_norm_rotary(
-            &qkv, &self.qn_w, cos, sin, self.nqh, self.hd, kv_start, self.eps,
-        )?;
-        cuda.qkv_extract_kv_norm_rotary_cache(
+        // 3+4. Fused QKV: extract Q (norm+rotary), K (norm+rotary→cache), V (raw→cache).
+        // One launch replaces qkv_extract_q_norm_rotary + qkv_extract_kv_norm_rotary_cache.
+        let q = cuda.qkv_extract_qkv_norm_rotary_cache(
             &mut kv.k[layer_idx], &mut kv.v[layer_idx],
-            &qkv, &self.kn_w, cos, sin,
-            self.nkvh, self.hd, q_dim, kv_dim,
+            &qkv, &self.qn_w, &self.kn_w, cos, sin,
+            self.nqh, self.nkvh, self.hd, q_dim, kv_dim,
             kv.max_seq, kv_start, kv_start, self.eps,
         )?;
         drop(qkv);

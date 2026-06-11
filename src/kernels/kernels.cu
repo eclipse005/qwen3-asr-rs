@@ -550,6 +550,91 @@ extern "C" __global__ void qkv_extract_q_norm_rotary_f16(
     }
 }
 
+// ─── Single-kernel QKV: extract Q, K, V from fused projection; norm+rotary on Q and K;
+//     write Q to q_out, K to k_cache, V to v_cache.  One launch replaces two.
+// Grid: x = b*s,  y = nqh + nkvh  (head slot)
+// Block: d threads cooperate over one row of head_dim.
+extern "C" __global__ void qkv_extract_qkv_norm_rotary_cache_f16(
+    __half* __restrict__ q_out,
+    __half* __restrict__ k_cache,
+    __half* __restrict__ v_cache,
+    const __half* __restrict__ qkv,
+    const __half* __restrict__ qn_w,
+    const __half* __restrict__ kn_w,
+    const __half* __restrict__ cos,
+    const __half* __restrict__ sin,
+    int b, int nqh, int nkvh, int s, int d, int total_cols,
+    int q_dim, int kv_dim, int max_seq, int start, int pos_offset, float eps
+) {
+    int bx = blockIdx.x;
+    int hy = blockIdx.y;
+    int ib = bx / s;
+    int is = bx - ib * s;
+    int tid = threadIdx.x;
+    int bs = blockDim.x;
+    int cs_row = pos_offset + is;
+    int half_ = d >> 1;
+
+    extern __shared__ float sdata[];
+
+    if (hy < nqh) {
+        // Q path
+        int ih = hy;
+        const __half* src = qkv + (ib * s + is) * total_cols + ih * d;
+        __half* dst = q_out + ((ib * nqh + ih) * s + is) * d;
+        float local = 0.0f;
+        for (int j = tid; j < d; j += bs) {
+            float v = __half2float(src[j]);
+            local += v * v;
+        }
+        sdata[tid] = local;
+        __syncthreads();
+        for (int sh = bs >> 1; sh > 0; sh >>= 1) {
+            if (tid < sh) sdata[tid] += sdata[tid + sh];
+            __syncthreads();
+        }
+        float inv_rms = rsqrtf(sdata[0] / (float)d + eps);
+        for (int j = tid; j < d; j += bs) {
+            float x_val_j = __half2float(src[j]) * inv_rms * __half2float(qn_w[j]);
+            int pj = (j < half_) ? (j + half_) : (j - half_);
+            float x_pair = __half2float(src[pj]) * inv_rms * __half2float(qn_w[pj]);
+            float pair_val = (j < half_) ? -x_pair : x_pair;
+            float c = __half2float(cos[cs_row * d + j]);
+            float si = __half2float(sin[cs_row * d + j]);
+            dst[j] = __float2half(x_val_j * c + pair_val * si);
+        }
+    } else {
+        // K+V path
+        int ih = hy - nqh;
+        if (ih >= nkvh) return;
+        const __half* k_src = qkv + (ib * s + is) * total_cols + q_dim + ih * d;
+        const __half* v_src = qkv + (ib * s + is) * total_cols + q_dim + kv_dim + ih * d;
+        int cache_idx = ((ib * nkvh + ih) * max_seq + (start + is)) * d;
+        float local = 0.0f;
+        for (int j = tid; j < d; j += bs) {
+            float v = __half2float(k_src[j]);
+            local += v * v;
+        }
+        sdata[tid] = local;
+        __syncthreads();
+        for (int sh = bs >> 1; sh > 0; sh >>= 1) {
+            if (tid < sh) sdata[tid] += sdata[tid + sh];
+            __syncthreads();
+        }
+        float inv_rms = rsqrtf(sdata[0] / (float)d + eps);
+        for (int j = tid; j < d; j += bs) {
+            float k_val_j = __half2float(k_src[j]) * inv_rms * __half2float(kn_w[j]);
+            int pj = (j < half_) ? (j + half_) : (j - half_);
+            float k_pair = __half2float(k_src[pj]) * inv_rms * __half2float(kn_w[pj]);
+            float pair_val = (j < half_) ? -k_pair : k_pair;
+            float c = __half2float(cos[cs_row * d + j]);
+            float si = __half2float(sin[cs_row * d + j]);
+            k_cache[cache_idx + j] = __float2half(k_val_j * c + pair_val * si);
+            v_cache[cache_idx + j] = v_src[j];
+        }
+    }
+}
+
 // ─── Fused KV path: extract K (with norm+rotary) and V from QKV, write both into KV cache ──
 // qkv [b, s, total_cols]; K at cols [q_dim..q_dim+kv_dim), V at [q_dim+kv_dim..q_dim+2*kv_dim).
 // Writes k_cache [b, nkvh, max_seq, d] and v_cache [b, nkvh, max_seq, d] at rows [start..start+s).
