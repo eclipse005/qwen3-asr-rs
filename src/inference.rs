@@ -71,6 +71,8 @@ pub(crate) struct AsrInferenceInner {
     pub(crate) gpu_decoder: GpuTextDecoder,
     #[cfg(feature = "cuda")]
     pub(crate) gpu_audio_encoder: GpuAudioEncoder,
+    #[cfg(feature = "cpu")]
+    pub(crate) cpu_decoder: crate::cpu_engine::CpuTextDecoder,
     pub(crate) mel_extractor: MelExtractor,
     pub(crate) tokenizer: tokenizers::Tokenizer,
     pub(crate) config: AsrConfig,
@@ -123,7 +125,16 @@ impl AsrInference {
             let text_decoder = TextDecoder::load(&weights, "thinker.model", &config.thinker_config.text_config, &device)
                 .context("load text decoder")?;
             let mel_extractor = MelExtractor::new(N_FFT, HOP_LENGTH, config.thinker_config.audio_config.num_mel_bins, MEL_SAMPLE_RATE);
-            let inner = AsrInferenceInner { audio_encoder, text_decoder, mel_extractor, tokenizer, config, device };
+            #[cfg(feature = "cpu")]
+            let cpu_decoder = {
+                info!("Loading text decoder (CPU gemm+rayon engine)...");
+                crate::cpu_engine::CpuTextDecoder::load(&weights, "thinker.model", &config.thinker_config.text_config)
+                    .context("load CPU text decoder")?
+            };
+            let inner = AsrInferenceInner {
+                audio_encoder, text_decoder, mel_extractor, tokenizer, config, device,
+                #[cfg(feature = "cpu")] cpu_decoder,
+            };
             Ok(AsrInference { inner: Mutex::new(inner) })
         }
 
@@ -224,7 +235,7 @@ impl AsrInferenceInner {
         Ok(audio_embeds)
     }
 
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(all(not(feature = "cuda"), not(feature = "cpu")))]
     pub(crate) fn generate(&self, audio_embeds: &Tensor<Backend, 2>, language: Option<&str>, prefix_text: Option<&str>, max_new_tokens: usize) -> anyhow::Result<Vec<u32>> {
         let nat = audio_embeds.dims()[0];
         let (input_ids, audio_start_pos) = self.build_prompt(nat, language, prefix_text)?;
@@ -273,6 +284,79 @@ impl AsrInferenceInner {
             let sl = self.text_decoder.forward(&ne, &nc, &ns, &mut kv_cache, false, true);
             let vs = sl.dims()[2];
             next_logits = sl.reshape([1, vs]);
+            current_pos += 1;
+        }
+
+        info!("Generated {} tokens", generated_ids.len());
+        Ok(generated_ids)
+    }
+
+    /// CPU-feature generate(): runs the entire text decoder through the hand-written
+    /// gemm + rayon engine in `cpu_engine.rs`.  The audio encoder still uses burn-flex
+    /// (audio is ~5% of total time; the win is the decode loop, where every cuBLAS-equivalent
+    /// matmul runs with rayon all-cores instead of the m=1 single-threaded GEMV that
+    /// burn-flex's threshold leaves behind).
+    #[cfg(feature = "cpu")]
+    pub(crate) fn generate(&self, audio_embeds: &Tensor<Backend, 2>, language: Option<&str>, prefix_text: Option<&str>, max_new_tokens: usize) -> anyhow::Result<Vec<u32>> {
+        use crate::cpu_engine::{CpuTensor, CpuKvCache, compute_mrope_cos_sin as cpu_mrope};
+
+        let nat = audio_embeds.dims()[0];
+        let (input_ids, audio_start_pos) = self.build_prompt(nat, language, prefix_text)?;
+        let seq_len = input_ids.len();
+        let text_cfg = &self.config.thinker_config.text_config;
+        let hidden_size = text_cfg.hidden_size;
+
+        // Build prompt hidden states on CPU: embed prompt tokens, splice in audio embeds.
+        let before_ids: Vec<i64> = input_ids[..audio_start_pos].to_vec();
+        let after_ids: Vec<i64> = input_ids[audio_start_pos + nat..].to_vec();
+        let before_emb = self.cpu_decoder.embed_ids(&before_ids);
+        let after_emb = self.cpu_decoder.embed_ids(&after_ids);
+        let ae_data = audio_embeds.clone().into_data();
+        let ae_f32: Vec<f32> = ae_data.to_vec::<f32>()
+            .map_err(|e| anyhow::anyhow!("audio_embeds to_vec failed: {:?}", e))?;
+
+        let mut hs_data = Vec::with_capacity(seq_len * hidden_size);
+        hs_data.extend_from_slice(&before_emb.data);
+        hs_data.extend_from_slice(&ae_f32);
+        hs_data.extend_from_slice(&after_emb.data);
+        let hidden_states = CpuTensor::new(hs_data, vec![1, seq_len, hidden_size]);
+
+        // MRoPE tables for the full conversation.
+        let total_positions = seq_len + max_new_tokens;
+        let all_pos: Vec<i64> = (0..total_positions as i64).collect();
+        let full_ids: [Vec<i64>; 3] = [all_pos.clone(), all_pos.clone(), all_pos.clone()];
+        let (cos_table, sin_table) = cpu_mrope(
+            &full_ids, text_cfg.head_dim, text_cfg.rope_theta,
+            &text_cfg.mrope_section(), text_cfg.mrope_interleaved(),
+        );
+
+        // Pre-allocate KV cache for the full max length.
+        let mut kv_cache = CpuKvCache::new(
+            text_cfg.num_hidden_layers, 1,
+            text_cfg.num_key_value_heads, total_positions, text_cfg.head_dim,
+        );
+
+        // Prefill.
+        let logits = self.cpu_decoder.forward(
+            hidden_states, &cos_table, &sin_table, &mut kv_cache, 0, true, true,
+        );
+        let mut current_pos = seq_len;
+
+        let mut generated_ids: Vec<u32> = Vec::new();
+        let eos_ids: &[i64] = &[ENDOFTEXT_TOKEN_ID, IM_END_TOKEN_ID];
+        let mut next_token = crate::cpu_engine::argmax(&logits.data) as i64;
+
+        // Decode loop.
+        for _step in 0..max_new_tokens {
+            if eos_ids.contains(&next_token) { break; }
+            generated_ids.push(next_token as u32);
+
+            let ne = self.cpu_decoder.embed_ids(&[next_token])
+                .reshape(vec![1, 1, hidden_size]);
+            let sl = self.cpu_decoder.forward(
+                ne, &cos_table, &sin_table, &mut kv_cache, current_pos, false, true,
+            );
+            next_token = crate::cpu_engine::argmax(&sl.data) as i64;
             current_pos += 1;
         }
 

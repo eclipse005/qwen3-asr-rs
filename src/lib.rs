@@ -11,6 +11,8 @@ mod streaming;
 mod cudarc_engine;
 #[cfg(feature = "cuda")]
 mod gpu_audio_encoder;
+#[cfg(feature = "cpu")]
+mod cpu_engine;
 
 pub use error::{AsrError, Result};
 pub use inference::{AsrInference, TranscribeOptions, TranscribeResult};
@@ -49,8 +51,8 @@ pub type Device = burn::backend::wgpu::WgpuDevice;
 pub fn best_device() -> Device { Device::default() }
 
 #[cfg(feature = "cpu")]
-pub type Backend = burn::backend::ndarray::NdArray<f32>;
+pub type Backend = burn::backend::Flex;
 #[cfg(feature = "cpu")]
-pub type Device = burn::backend::ndarray::NdArrayDevice;
+pub type Device = burn::backend::flex::FlexDevice;
 #[cfg(feature = "cpu")]
 pub fn best_device() -> Device { Device::default() }
