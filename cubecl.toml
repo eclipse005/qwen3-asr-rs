@@ -1,0 +1,6 @@
+[autotune]
+level = "full"
+cache = "target"
+
+[compilation]
+logger = { level = "basic" }
