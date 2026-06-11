@@ -21,13 +21,16 @@
 
 | 音频 | 起点 | **现在 RTFx** | candle CUDA |
 |------|-----|-----|-----|
-| 15s 英文 | 0.44x | **12.55x** ✅ | ~7.5x |
-| 30s 中文 | 0.25x | **10.19x** ✅ | ~7.5x |
-| 90s 英文 | — | **10.84x** ✅ | — |
-| 180s 英文 | — | **10.69x** ✅ | — |
-| 180s 中文 | — | **9.82x** | — |
+| 15s 英文 | 0.44x | **23.03x** ✅ | ~7.5x |
+| 30s 中文 | 0.25x | **19.93x** ✅ | ~7.5x |
+| 90s 英文 | — | **17.85x** ✅ | — |
+| 90s 日文 | — | **19.20x** ✅ | — |
+| 180s 英文 | — | **16.76x** ✅ | — |
+| 180s 中文 | — | **15.47x** | — |
+| 1.7B-15s | — | 11.37x | — |
+| 1.7B-30s | — | 10.05x | — |
 
-> **关键拐点**：从 0.25x → 10.19x 是约 **40x 提速**，4/5 测试已超过 10x。
+> **关键拐点**：从 0.25x → 19.93x 是约 **80x 提速**，0.6B 全部测试 ≥ 15x。
 
 ---
 
@@ -261,6 +264,7 @@ Remove-Item D:\qwen3-asr-burn\target\autotune -Recurse -Force
 | linear_gpu_accum (cuBLAS beta=1 残差融合) | 10.62x | 7.72x | 7.23x | O-proj 和 down-proj 用 cuBLAS 直接累加到残差 |
 | skip swap_dims_12 on s=1 (no-op) | 11.39x | 8.40x | 7.32x | s=1 时 swap [b,h,1,d]→[b,1,h,d] 是 no-op |
 | **fused_gqa_decode_split (flash-attn 2-kernel)** | **12.55x** | **10.19x** | **10.69x** | 长 context decode 跨 block 并行 + online-softmax 合并 |
+| **alloc_uninit_f16 (skip memset_d8_async)** | **23.03x** | **19.93x** | **16.76x** | 用 `stream.alloc::<f16>` 替代 `alloc_zeros`，每个 cuBLAS/kernel output 省一次 memset launch；Pascal+Windows 下 driver enqueue 限速 → 80% 节省 |
 
 ---
 

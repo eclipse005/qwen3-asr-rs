@@ -182,6 +182,48 @@ fn test_q06_90s() {
 
 #[test]
 #[ignore]
+fn test_q06_90s_ja() {
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .is_test(true).try_init();
+    let device = qwen3_asr_burn::best_device();
+    let engine = qwen3_asr_burn::AsrInference::load(
+        std::path::Path::new(&model_dir_06()), device,
+    ).expect("load 0.6B");
+    let t0 = std::time::Instant::now();
+    let result = engine.transcribe(
+        &fixture("90s_ja.wav"),
+        qwen3_asr_burn::TranscribeOptions::default().with_max_new_tokens(1024),
+    ).expect("transcribe");
+    let elapsed = t0.elapsed().as_secs_f32();
+    println!("0.6B-90s_ja | {:.3}s elapsed | RTFx {:.2}x", elapsed, 90.0 / elapsed);
+    println!("Language : {}", result.language);
+    println!("Text: {}", result.text);
+    assert!(!result.text.is_empty());
+}
+
+#[test]
+#[ignore]
+fn test_q17_90s_ja() {
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .is_test(true).try_init();
+    let device = qwen3_asr_burn::best_device();
+    let engine = qwen3_asr_burn::AsrInference::load(
+        std::path::Path::new(&model_dir_17()), device,
+    ).expect("load 1.7B");
+    let t0 = std::time::Instant::now();
+    let result = engine.transcribe(
+        &fixture("90s_ja.wav"),
+        qwen3_asr_burn::TranscribeOptions::default().with_max_new_tokens(1024),
+    ).expect("transcribe");
+    let elapsed = t0.elapsed().as_secs_f32();
+    println!("1.7B-90s_ja | {:.3}s elapsed | RTFx {:.2}x", elapsed, 90.0 / elapsed);
+    println!("Language : {}", result.language);
+    println!("Text: {}", result.text);
+    assert!(!result.text.is_empty());
+}
+
+#[test]
+#[ignore]
 fn test_q06_180s() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true).try_init();

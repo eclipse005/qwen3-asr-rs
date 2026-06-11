@@ -193,6 +193,12 @@ impl CudaState {
     pub fn alloc_zeros_f16(&self, n: usize) -> Result<CudaSlice<f16>> {
         Ok(self.stream.alloc_zeros::<f16>(n)?)
     }
+    /// Allocate uninitialized f16 — caller MUST ensure every byte is written before read.
+    /// Saves one memset_d8_async vs `alloc_zeros_f16` for cuBLAS/kernel outputs that are
+    /// fully overwritten (beta=0 GEMM, fused attention writing all of `out`, etc.).
+    pub fn alloc_uninit_f16(&self, n: usize) -> Result<CudaSlice<f16>> {
+        Ok(unsafe { self.stream.alloc::<f16>(n)? })
+    }
     pub fn alloc_zeros_i32(&self, n: usize) -> Result<CudaSlice<i32>> {
         Ok(self.stream.alloc_zeros::<i32>(n)?)
     }
@@ -219,7 +225,7 @@ impl CudaState {
 
     /// Device→device clone of a GpuTensor (one memcpy, no kernel launch).
     pub fn clone_tensor(&self, x: &GpuTensor) -> Result<GpuTensor> {
-        let mut out = self.alloc_zeros_f16(x.numel())?;
+        let mut out = self.alloc_uninit_f16(x.numel())?;
         self.stream.memcpy_dtod(&x.data, &mut out)?;
         Ok(GpuTensor::new(out, x.shape().to_vec()))
     }
@@ -237,7 +243,7 @@ impl CudaState {
         let k = x.shape()[nd - 1];
         let n = w.rows;
         assert_eq!(k, w.cols, "linear K mismatch: x last={} vs W cols={}", k, w.cols);
-        let mut y = self.alloc_zeros_f16(m * n)?;
+        let mut y = self.alloc_uninit_f16(m * n)?;
         unsafe {
             self.blas.gemm(
                 GemmConfig {
@@ -294,7 +300,7 @@ impl CudaState {
     pub fn attention_qk(&self, q: &GpuTensor, k: &GpuTensor) -> Result<GpuTensor> {
         let b = q.shape()[0]; let h = q.shape()[1]; let m = q.shape()[2]; let d = q.shape()[3];
         let n = k.shape()[2];
-        let mut s = self.alloc_zeros_f16(b * h * m * n)?;
+        let mut s = self.alloc_uninit_f16(b * h * m * n)?;
         let batch = (b * h) as i32;
         unsafe {
             self.blas.gemm_strided_batched(
@@ -323,7 +329,7 @@ impl CudaState {
         let b = attn.shape()[0]; let h = attn.shape()[1];
         let m = attn.shape()[2]; let n = attn.shape()[3];
         let d = v.shape()[3];
-        let mut o = self.alloc_zeros_f16(b * h * m * d)?;
+        let mut o = self.alloc_uninit_f16(b * h * m * d)?;
         let batch = (b * h) as i32;
         unsafe {
             self.blas.gemm_strided_batched(
@@ -365,7 +371,7 @@ impl CudaState {
         let nd = x.shape().len();
         let last = x.shape()[nd - 1];
         let outer: usize = x.shape()[..nd - 1].iter().product();
-        let mut out = self.alloc_zeros_f16(x.numel())?;
+        let mut out = self.alloc_uninit_f16(x.numel())?;
         let bs = block_for_reduction(last);
         let cfg = LaunchConfig {
             grid_dim: (outer as u32, 1, 1),
@@ -383,7 +389,7 @@ impl CudaState {
 
     pub fn add(&self, a: &GpuTensor, b: &GpuTensor) -> Result<GpuTensor> {
         let n = a.numel();
-        let mut out = self.alloc_zeros_f16(n)?;
+        let mut out = self.alloc_uninit_f16(n)?;
         let cfg = LaunchConfig::for_num_elems(n as u32);
         let n_i = n as i32;
         let mut bb = self.stream.launch_builder(&self.k.add);
@@ -408,7 +414,7 @@ impl CudaState {
         let nd = residual.shape().len();
         let last = residual.shape()[nd - 1];
         let outer: usize = residual.shape()[..nd - 1].iter().product();
-        let mut out = self.alloc_zeros_f16(residual.numel())?;
+        let mut out = self.alloc_uninit_f16(residual.numel())?;
         let bs = block_for_reduction(last);
         let cfg = LaunchConfig {
             grid_dim: (outer as u32, 1, 1),
@@ -428,7 +434,7 @@ impl CudaState {
         let two_inter = gu.shape()[nd - 1];
         let inter = two_inter / 2;
         let outer: usize = gu.shape()[..nd - 1].iter().product();
-        let mut out = self.alloc_zeros_f16(outer * inter)?;
+        let mut out = self.alloc_uninit_f16(outer * inter)?;
         let cfg = LaunchConfig::for_num_elems((outer * inter) as u32);
         let outer_i = outer as i32;
         let inter_i = inter as i32;
@@ -454,7 +460,7 @@ impl CudaState {
             block_dim: (bs, 1, 1),
             shared_mem_bytes: bs * 4,
         };
-        let mut out = self.alloc_zeros_f16(scores.numel())?;
+        let mut out = self.alloc_uninit_f16(scores.numel())?;
         let m_i = m as i32;
         let n_i = n as i32;
         let causal_i: i32 = if causal { 1 } else { 0 };
@@ -471,7 +477,7 @@ impl CudaState {
         let s = x.shape();
         assert_eq!(s.len(), 4);
         let n = x.numel();
-        let mut out = self.alloc_zeros_f16(n)?;
+        let mut out = self.alloc_uninit_f16(n)?;
         let cfg = LaunchConfig::for_num_elems(n as u32);
         let s0 = s[0] as i32; let s1 = s[1] as i32; let s2 = s[2] as i32; let s3 = s[3] as i32;
         let po = pos_offset as i32;
@@ -491,7 +497,7 @@ impl CudaState {
         let s = x.shape();
         assert_eq!(s.len(), 4);
         let (b, h, sl, d) = (s[0], s[1], s[2], s[3]);
-        let mut out = self.alloc_zeros_f16(x.numel())?;
+        let mut out = self.alloc_uninit_f16(x.numel())?;
         let bs = block_for_reduction(d);
         let cfg = LaunchConfig {
             grid_dim: ((b * h * sl) as u32, 1, 1),
@@ -514,7 +520,7 @@ impl CudaState {
     ) -> Result<GpuTensor> {
         let nqh = nkvh * n_rep;
         let total = b * nqh * cur_len * d;
-        let mut out = self.alloc_zeros_f16(total)?;
+        let mut out = self.alloc_uninit_f16(total)?;
         let cfg = LaunchConfig::for_num_elems(total as u32);
         let b_i = b as i32; let nkvh_i = nkvh as i32; let max_i = max_seq as i32;
         let d_i = d as i32; let nrep_i = n_rep as i32; let cur_i = cur_len as i32;
@@ -529,7 +535,7 @@ impl CudaState {
     pub fn embed_lookup(&self, table: &GpuWeight, ids_gpu: &CudaSlice<i64>) -> Result<GpuTensor> {
         let n = ids_gpu.len();
         let d = table.cols;
-        let mut out = self.alloc_zeros_f16(n * d)?;
+        let mut out = self.alloc_uninit_f16(n * d)?;
         let cfg = LaunchConfig {
             grid_dim: (n as u32, 1, 1),
             block_dim: (256, 1, 1),
@@ -586,7 +592,7 @@ impl CudaState {
         let s = x.shape();
         assert_eq!(s.len(), 4);
         let (d0, d1, d2, d3) = (s[0], s[1], s[2], s[3]);
-        let mut out = self.alloc_zeros_f16(x.numel())?;
+        let mut out = self.alloc_uninit_f16(x.numel())?;
         let cfg = LaunchConfig::for_num_elems(x.numel() as u32);
         let d0_i = d0 as i32; let d1_i = d1 as i32; let d2_i = d2 as i32; let d3_i = d3 as i32;
         let mut bb = self.stream.launch_builder(&self.k.swap_dims_12);
@@ -601,7 +607,7 @@ impl CudaState {
         let s = qkv.shape();
         assert_eq!(s.len(), 3);
         let (b, sl, total) = (s[0], s[1], s[2]);
-        let mut out = self.alloc_zeros_f16(b * h * sl * d)?;
+        let mut out = self.alloc_uninit_f16(b * h * sl * d)?;
         let cfg = LaunchConfig::for_num_elems((b * h * sl * d) as u32);
         let b_i = b as i32; let sl_i = sl as i32; let h_i = h as i32; let d_i = d as i32;
         let tot_i = total as i32; let off_i = offset as i32;
@@ -622,7 +628,7 @@ impl CudaState {
         let s = qkv.shape();
         assert_eq!(s.len(), 3);
         let (b, sl, total_cols) = (s[0], s[1], s[2]);
-        let mut q_out = self.alloc_zeros_f16(b * nqh * sl * d)?;
+        let mut q_out = self.alloc_uninit_f16(b * nqh * sl * d)?;
         let bs = block_for_reduction(d);
         let cfg = LaunchConfig {
             grid_dim: ((b * nqh * sl) as u32, 1, 1),
@@ -720,7 +726,7 @@ impl CudaState {
         let nd = x.shape().len();
         let last = x.shape()[nd - 1];
         let outer: usize = x.shape()[..nd - 1].iter().product();
-        let mut out = self.alloc_zeros_f16(x.numel())?;
+        let mut out = self.alloc_uninit_f16(x.numel())?;
         let bs = block_for_reduction(last);
         let cfg = LaunchConfig {
             grid_dim: (outer as u32, 1, 1),
@@ -755,7 +761,7 @@ impl CudaState {
         let (b, h, sl, d) = (s[0], s[1], s[2], s[3]);
         assert!(start + len <= sl);
         let total = b * h * len * d;
-        let mut out = self.alloc_zeros_f16(total)?;
+        let mut out = self.alloc_uninit_f16(total)?;
         let cfg = LaunchConfig::for_num_elems(total as u32);
         let b_i = b as i32; let h_i = h as i32; let sl_i = sl as i32;
         let d_i = d as i32; let start_i = start as i32; let len_i = len as i32;
@@ -800,7 +806,7 @@ impl CudaState {
         // im2col: [b*h_out*w_out, c_in*9] (row-major)
         let m = b * h_out * w_out;
         let k = c_in * 9;
-        let mut col = self.alloc_zeros_f16(m * k)?;
+        let mut col = self.alloc_uninit_f16(m * k)?;
         let cfg = LaunchConfig::for_num_elems((m * k) as u32);
         let b_i = b as i32; let cin_i = c_in as i32;
         let h_i = h as i32; let w_i = w as i32;
@@ -815,7 +821,7 @@ impl CudaState {
         // We need weight reinterpreted as [c_out, c_in*9] (already that layout since
         // weight is stored as [c_out, c_in, 3, 3] row-major = [c_out, c_in*9]).
         let n = c_out;
-        let mut gemm_out = self.alloc_zeros_f16(m * n)?;
+        let mut gemm_out = self.alloc_uninit_f16(m * n)?;
         unsafe {
             self.blas.gemm(
                 GemmConfig {
@@ -833,7 +839,7 @@ impl CudaState {
 
         // Post: [b*h_out*w_out, c_out] → [b, c_out, h_out, w_out] with bias+GELU
         let total = b * c_out * h_out * w_out;
-        let mut out = self.alloc_zeros_f16(total)?;
+        let mut out = self.alloc_uninit_f16(total)?;
         let cfg = LaunchConfig::for_num_elems(total as u32);
         let cout_i = c_out as i32;
         let mut bb = self.stream.launch_builder(&self.k.conv_postprocess);
@@ -854,7 +860,7 @@ impl CudaState {
         assert_eq!(s.len(), 4);
         assert_eq!(s[2], 1, "fused_gqa_decode requires s_q = 1");
         let (b, nqh, _, d) = (s[0], s[1], s[2], s[3]);
-        let mut out = self.alloc_zeros_f16(b * nqh * d)?;
+        let mut out = self.alloc_uninit_f16(b * nqh * d)?;
         // Adaptive block size: scale parallelism with cur_len so each thread does roughly the
         // same amount of work whether we have 200 or 2000 tokens of context.  bs must be a
         // multiple of d (so the stage-4 t-chunks layout works) and a power of 2 (for reductions).
@@ -921,7 +927,7 @@ impl CudaState {
         }
 
         // Phase 2: merge chunks → final output.
-        let mut out = self.alloc_zeros_f16(b * nqh * d)?;
+        let mut out = self.alloc_uninit_f16(b * nqh * d)?;
         {
             let cfg = LaunchConfig {
                 grid_dim: ((b * nqh) as u32, 1, 1),
@@ -1267,7 +1273,7 @@ impl GpuTextDecoder {
         let (b, sl, hidden) = (s[0], s[1], s[2]);
         // For [1, sl, hidden] the last token's contiguous row sits at offset (sl-1)*hidden.
         // We allocate a fresh buffer and ask the stream to copy device→device.
-        let mut out = self.cuda.alloc_zeros_f16(b * hidden)?;
+        let mut out = self.cuda.alloc_uninit_f16(b * hidden)?;
         let src_offset = (sl - 1) * hidden;
         let src_view = h.data.slice(src_offset..src_offset + b * hidden);
         self.cuda.stream.memcpy_dtod(&src_view, &mut out)?;
