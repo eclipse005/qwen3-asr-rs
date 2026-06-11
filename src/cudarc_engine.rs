@@ -95,7 +95,9 @@ pub(crate) struct CudaKernels {
     pub rms_norm_rotary: CudaFunction,
     pub repeat_kv_from_cache: CudaFunction,
     pub embed_lookup: CudaFunction,
+    pub embed_lookup_single_i32: CudaFunction,
     pub argmax: CudaFunction,
+    pub argmax_into_slot: CudaFunction,
     pub lm_head_gemv_argmax: CudaFunction,
     pub swap_dims_12: CudaFunction,
     pub qkv_split: CudaFunction,
@@ -160,7 +162,9 @@ impl CudaState {
             rms_norm_rotary: module.load_function("rms_norm_rotary_f16")?,
             repeat_kv_from_cache: module.load_function("repeat_kv_from_cache_f16")?,
             embed_lookup: module.load_function("embed_lookup_f16")?,
+            embed_lookup_single_i32: module.load_function("embed_lookup_single_i32_f16")?,
             argmax: module.load_function("argmax_f16")?,
+            argmax_into_slot: module.load_function("argmax_into_slot_f16")?,
             lm_head_gemv_argmax: module.load_function("lm_head_gemv_argmax_f16")?,
             swap_dims_12: module.load_function("swap_dims_12_f16")?,
             qkv_split: module.load_function("qkv_split_f16")?,
@@ -567,6 +571,22 @@ impl CudaState {
         unsafe { bb.launch(cfg) }?;
         let v = self.download_i32(&out)?;
         Ok(v[0])
+    }
+
+    /// Argmax that writes its result into `token_buf[slot]` (preallocated) instead of
+    /// allocating a fresh i32 each call.  Pair with `download_i32(token_buf)` to get the value.
+    pub fn argmax_into(&self, x: &GpuTensor, token_buf: &mut CudaSlice<i32>, slot: usize) -> Result<()> {
+        let n = x.numel();
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (1024, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_i = n as i32; let slot_i = slot as i32;
+        let mut bb = self.stream.launch_builder(&self.k.argmax_into_slot);
+        bb.arg(token_buf); bb.arg(&x.data); bb.arg(&n_i); bb.arg(&slot_i);
+        unsafe { bb.launch(cfg) }?;
+        Ok(())
     }
 
     /// Fused: y = hidden @ embed_table^T, then argmax(y).  Saves one alloc + one launch
@@ -1222,6 +1242,26 @@ impl GpuTextDecoder {
     pub fn embed_ids(&self, ids: &[i64]) -> Result<GpuTensor> {
         let ids_gpu = self.cuda.upload_i64(ids)?;
         self.cuda.embed_lookup(&self.embed_table, &ids_gpu)
+    }
+
+    /// Single-token embed lookup whose id sits in a pre-allocated GPU i32 buffer.
+    /// Saves the htod upload + temporary alloc that `embed_ids(&[tok])` does each step
+    /// in the decode hot loop.  Returns shape [1, 1, hidden].
+    pub fn embed_id_from_gpu_slot(&self, token_buf: &CudaSlice<i32>, slot: usize) -> Result<GpuTensor> {
+        let d = self.embed_table.cols;
+        let mut out = self.cuda.alloc_uninit_f16(d)?;
+        let bs = (d as u32).min(1024);
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (bs, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let slot_i = slot as i32; let d_i = d as i32;
+        let mut bb = self.cuda.stream.launch_builder(&self.cuda.k.embed_lookup_single_i32);
+        bb.arg(&mut out); bb.arg(&self.embed_table.data); bb.arg(token_buf);
+        bb.arg(&slot_i); bb.arg(&d_i);
+        unsafe { bb.launch(cfg) }?;
+        Ok(GpuTensor::new(out, vec![1, 1, d]))
     }
 
     /// Forward pass.

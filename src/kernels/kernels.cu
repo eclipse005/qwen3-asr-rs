@@ -324,6 +324,24 @@ extern "C" __global__ void embed_lookup_f16(
     }
 }
 
+// ─── Single-token embed lookup, id read from GPU i32 buffer ──────
+// Used by the decode hot loop to chain argmax (writes ids[slot]) → embed (reads ids[slot])
+// without an htod round-trip.
+extern "C" __global__ void embed_lookup_single_i32_f16(
+    __half* __restrict__ out,
+    const __half* __restrict__ table,
+    const int* __restrict__ ids,
+    int slot,
+    int d
+) {
+    int tid = threadIdx.x;
+    int bs = blockDim.x;
+    long long id = (long long)ids[slot];
+    for (int j = tid; j < d; j += bs) {
+        out[j] = table[id * (long long)d + j];
+    }
+}
+
 // ─── Fused LM-head GEMV + argmax (decode-only) ─────────────────────
 // hidden: [1, 1, hs]   embed_table: [vocab, hs]  (acts as lm_head weight; y = hidden @ embed_table^T)
 // Computes logits = hidden @ embed_table^T (length vocab), tracks argmax inline.
@@ -404,6 +422,41 @@ extern "C" __global__ void argmax_f16(
         __syncthreads();
     }
     if (tid == 0) *out_idx = sidx[0];
+}
+
+// Same as argmax_f16 but writes into out_idx[slot] instead of out_idx[0].
+// Lets the decode loop reuse a single i32 buffer across all steps and chain
+// the result into embed_lookup_single_i32_f16 without an htod round-trip.
+extern "C" __global__ void argmax_into_slot_f16(
+    int* __restrict__ out_idx,
+    const __half* __restrict__ x,
+    int n,
+    int slot
+) {
+    int tid = threadIdx.x;
+    int bs = blockDim.x;
+    __shared__ float smax[1024];
+    __shared__ int sidx[1024];
+
+    float local_max = -INFINITY;
+    int local_idx = 0;
+    for (int i = tid; i < n; i += bs) {
+        float v = __half2float(x[i]);
+        if (v > local_max) { local_max = v; local_idx = i; }
+    }
+    smax[tid] = local_max;
+    sidx[tid] = local_idx;
+    __syncthreads();
+    for (int s = bs >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (smax[tid + s] > smax[tid]) {
+                smax[tid] = smax[tid + s];
+                sidx[tid] = sidx[tid + s];
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) out_idx[slot] = sidx[0];
 }
 
 // ─── Swap dims 1 and 2 of a 4-D tensor ─────────────────────────────

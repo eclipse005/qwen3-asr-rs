@@ -336,8 +336,14 @@ impl AsrInferenceInner {
         let mut generated_ids: Vec<u32> = Vec::new();
         let eos_ids: &[i64] = &[ENDOFTEXT_TOKEN_ID, IM_END_TOKEN_ID];
 
-        // First token from prefill (slice last row already done by llo)
-        let mut next_token = cuda.argmax(&logits)? as i64;
+        // GPU-resident next-token slot (slot 0) so we can chain argmax→embed without an htod roundtrip.
+        let mut token_buf = cuda.alloc_uninit_i32(1)?;
+
+        // First token from prefill (slice last row already done by llo).  Write into token_buf[0]
+        // and download to seed the EOS check.
+        cuda.argmax_into(&logits, &mut token_buf, 0)?;
+        let dl = cuda.download_i32(&token_buf)?;
+        let mut next_token = dl[0] as i64;
 
         // ── Decode loop ──
         let t_decode = std::time::Instant::now();
@@ -345,10 +351,12 @@ impl AsrInferenceInner {
             if eos_ids.contains(&next_token) { break; }
             generated_ids.push(next_token as u32);
 
-            let ne = self.gpu_decoder.embed_ids(&[next_token])?
+            let ne = self.gpu_decoder.embed_id_from_gpu_slot(&token_buf, 0)?
                 .reshape(vec![1, 1, hidden_size]);
             let sl = self.gpu_decoder.forward(ne, &cos_table, &sin_table, &mut kv_cache, current_pos, false, true)?;
-            next_token = cuda.argmax(&sl)? as i64;
+            cuda.argmax_into(&sl, &mut token_buf, 0)?;
+            let dl = cuda.download_i32(&token_buf)?;
+            next_token = dl[0] as i64;
             current_pos += 1;
         }
         cuda.synchronize()?;
