@@ -1,9 +1,0 @@
-
-running 1 test
-test test_cpu_90s ... CPU 0.6B-90s | 22.503s elapsed | RTFx 4.00x
-Language : English
-Text     : All right, viewers, welcome everyone into this crash course about our new 50-minute timeframe entry models and strategy. If you are here, it means you have already completed the four-hour swing trading strategy, so congratulations on reaching this next stage in your trading journey. Now, let me be clear upfront: if you haven't fully learned and understood the four-hour strategy, this 50-minute course won't make so much sense to you. The 50-minute entries are built on top of what we already know from the higher timeframe strategy, so if you skip ahead, I strongly recommend you going back first before diving in here on the 50-minute timeframe. All right, so what's the difference about this course? Well, first off, we are keeping things simple, short videos, straight to the point, and focused purely on execution. But most importantly, you'll notice that we will be abandoning a few concepts from the four-hour course by introducing some new elements into our playbook. For example, one major shift is that we'll no longer be using the order book entries the way we did them before on the four-hour strategy. But don't worry, we'll cover that exactly why and what we will use instead. So, who is this entry model for? Who is this strategy for? Who will use this 50-minute timeframe strategy? This is for those traders who have some extra time to monitor the markets and want to scale in into opportunities to trades on the lower timeframe while still leveraging.
-ok
-
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 25.11s
-
