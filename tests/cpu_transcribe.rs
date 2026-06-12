@@ -1,6 +1,6 @@
-//! CPU f32 transcribe test — correctness + RTFx timing.
+//! CPU f32 transcribe benchmarks — all fixtures, RTFx timing.
 //!
-//! Run: cargo test --release --no-default-features --features cpu --test cpu_transcribe -- --nocapture
+//! Run: cargo test --release --no-default-features --features cpu --test cpu_transcribe -- --nocapture --test-threads=1
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -21,11 +21,7 @@ fn fixture(name: &str) -> String {
     base.join(name).to_string_lossy().into_owned()
 }
 
-#[test]
-fn test_cpu_sample1() {
-    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .is_test(true).try_init();
-
+fn run_cpu(name: &str, wav: &str, duration_s: f32) {
     let backend = qwen3_asr::Backend::Cpu;
     let engine = qwen3_asr::AsrInference::load(
         std::path::Path::new(&model_dir_06()), backend,
@@ -33,64 +29,20 @@ fn test_cpu_sample1() {
 
     let t0 = Instant::now();
     let result = engine.transcribe(
-        &fixture("sample1.wav"),
+        &fixture(wav),
         qwen3_asr::TranscribeOptions::default(),
     ).expect("transcribe");
     let elapsed = t0.elapsed().as_secs_f32();
+    let rtfx = if duration_s > 0.0 { format!("{:.2}x", duration_s / elapsed) } else { "—".to_string() };
 
-    println!("CPU sample1 | {:.3}s elapsed", elapsed);
-    println!("Language : {}", result.language);
-    println!("Text     : {}", result.text);
-
+    println!("CPU {} | {:.3}s elapsed | RTFx {} | {} | {}", name, elapsed, rtfx, result.language, result.text);
     assert!(!result.text.is_empty(), "Transcription should not be empty");
 }
 
-#[test]
-fn test_cpu_15s() {
-    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .is_test(true).try_init();
-
-    let backend = qwen3_asr::Backend::Cpu;
-    let engine = qwen3_asr::AsrInference::load(
-        std::path::Path::new(&model_dir_06()), backend,
-    ).expect("load 0.6B CPU");
-
-    let t0 = Instant::now();
-    let result = engine.transcribe(
-        &fixture("15s.wav"),
-        qwen3_asr::TranscribeOptions::default(),
-    ).expect("transcribe");
-    let elapsed = t0.elapsed().as_secs_f32();
-    let rtfx = 15.0 / elapsed;
-
-    println!("CPU 0.6B-15s | {:.3}s elapsed | RTFx {:.2}x", elapsed, rtfx);
-    println!("Language : {}", result.language);
-    println!("Text     : {}", result.text);
-
-    assert!(!result.text.is_empty(), "Transcription should not be empty");
-}
-
-#[test]
-fn test_cpu_30s() {
-    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .is_test(true).try_init();
-
-    let backend = qwen3_asr::Backend::Cpu;
-    let engine = qwen3_asr::AsrInference::load(
-        std::path::Path::new(&model_dir_06()), backend,
-    ).expect("load 0.6B CPU");
-
-    let t0 = Instant::now();
-    let result = engine.transcribe(
-        &fixture("30s.wav"),
-        qwen3_asr::TranscribeOptions::default(),
-    ).expect("transcribe");
-    let elapsed = t0.elapsed().as_secs_f32();
-    let rtfx = 30.0 / elapsed;
-
-    println!("CPU 0.6B-30s | {:.3}s elapsed | RTFx {:.2}x", elapsed, rtfx);
-    println!("Language : {}", result.language);
-    println!("Text     : {}", result.text);
-
-    assert!(!result.text.is_empty(), "Transcription should not be empty");
-}
+#[test] fn test_cpu_sample1()   { run_cpu("sample1",   "sample1.wav",   0.0); }
+#[test] fn test_cpu_15s()      { run_cpu("15s",       "15s.wav",      15.0); }
+#[test] fn test_cpu_30s()      { run_cpu("30s",       "30s.wav",      30.0); }
+#[test] fn test_cpu_90s()      { run_cpu("90s",       "90s.wav",      90.0); }
+#[test] fn test_cpu_89s_ja()   { run_cpu("89s_ja",    "ja_89s.wav",   89.0); }
+#[test] fn test_cpu_180s()     { run_cpu("180s",      "180s.wav",    180.0); }
+#[test] fn test_cpu_180s_en()  { run_cpu("180s_en",   "180s_en.wav", 180.0); }
