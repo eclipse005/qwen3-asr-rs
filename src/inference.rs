@@ -241,7 +241,7 @@ impl AsrInferenceInner {
 
     #[cfg(feature = "cpu")]
     fn encode_audio_cpu(&self, samples: &[f32]) -> anyhow::Result<Vec<f32>> {
-        // CPU audio encoder not yet ported off burn.  For v1, fail loudly so users don't
+        // CPU audio encoder is not yet implemented.  For v1, fail loudly so users don't
         // silently get wrong transcripts.
         let _ = samples;
         Err(anyhow::anyhow!(

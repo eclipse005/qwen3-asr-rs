@@ -1,4 +1,4 @@
-# ROADMAP — qwen3-asr-burn
+# ROADMAP — qwen3-asr
 
 > 写给下一个接手会话的 AI。读这一篇就能在 5 分钟内进入状态。
 
@@ -20,12 +20,12 @@ src/
 ├── hub.rs               # (可选) hub 模式下载
 ├── mel.rs               # mel spectrogram（CPU, f32）
 ├── inference.rs         # AsrInference 装配 + mel→embed→generate 主循环
-├── raw_tensor.rs        # safetensors 原始字节 view（替代 burn TensorData）
+├── raw_tensor.rs        # safetensors 原始字节 view（weight loading 用）
 ├── cpu_engine.rs        # 手写 CPU 文本解码器（gemm + rayon）
 ├── cudarc_engine.rs     # ★ 手写 GPU 文本解码器（cuBLAS + NVRTC kernel）+ DecodeScratch 复用
 ├── gpu_audio_encoder.rs # ★ 手写 GPU 音频编码器（cuBLAS + 自定义 conv2d/im2col）
 └── kernels/kernels.cu   # 所有 CUDA kernel（运行时 NVRTC 编译）
-tests/transcribe_burn.rs # 13 个 #[ignore] 集成测试（0.6B/1.7B × 各种时长）
+tests/transcribe.rs       # 13 个 #[ignore] 集成测试（0.6B/1.7B × 各种时长）
 scripts/bench.ps1        # 每个 test 独立 `cargo test` 进程跑（避免 cuBLAS/cache 跨测串味）
 ```
 
@@ -52,7 +52,7 @@ hub  = ["dep:reqwest"]
 | 180s 英文 | ~17× |
 | 1.7B-15s | ~11× |
 
-数字来源：`tests/transcribe_burn.rs`（必须 `--features cuda` + `--ignored --nocapture --test-threads=1`）。
+数字来源：`tests/transcribe.rs`（必须 `--features cuda` + `--ignored --nocapture --test-threads=1`）。
 
 ## 2. 关键架构事实
 
@@ -137,7 +137,7 @@ decode loop（每步）：
 ### 4.1 P0：稳定 + 验证
 
 - [ ] **跑一遍 `cargo check --features cuda`** 确认重构后编译通过（rustc 已经报了 dead-code 警告，已知 §3.4）
-- [ ] **跑 13 个集成测试**（`cargo test --release --features cuda --test transcribe_burn -- --ignored --nocapture --test-threads=1`），逐个确认 RTFx 数字没有回退
+- [ ] **跑 13 个集成测试**（`cargo test --release --features cuda --test transcribe -- --ignored --nocapture --test-threads=1`），逐个确认 RTFx 数字没有回退
 - [ ] 写一个最小 smoke test：输入 5s wav，断言输出非空、语言识别对——纳入 CI
 
 ### 4.2 P1：小优化（风险低、明确收益）
@@ -173,7 +173,7 @@ decode loop（每步）：
 ```
 1. 读 §0-§2（本文件）
 2. cargo check --features cuda  — 看新警告
-3. cargo test --release --features cuda --test transcribe_burn -- --ignored --nocapture --test-threads=1 test_q06_15s
+3. cargo test --release --features cuda --test transcribe -- --ignored --nocapture --test-threads=1 test_q06_15s
    — 验证主路径不退化
 4. 想要新优化前先看 §3 卡点，别重蹈覆辙
 5. 改完跑 §4.1 三个验证步骤

@@ -1,5 +1,5 @@
 #!/usr/bin/env pwsh
-# Run each transcribe_burn test as a SEPARATE `cargo test` invocation so the
+# Run each transcribe test as a SEPARATE `cargo test` invocation so the
 # CUDA driver / cuBLAS workspace / kernel cache start cold for every test.
 # This avoids cross-test cache-warmup artifacts that confound RTFx.
 #
@@ -69,7 +69,7 @@ foreach ($t in $tests) {
     # post-process it (cargo exits before the test's stdout flushes under
     # --nocapture, so we can't rely on the captured pipeline alone).
     $tmp = New-TemporaryFile
-    cargo test --release --features cuda --test transcribe_burn $fn -- --ignored --nocapture *> $tmp.FullName
+    cargo test --release --features cuda --test transcribe $fn -- --ignored --nocapture *> $tmp.FullName
     $cargoExit = $LASTEXITCODE
     $out = Get-Content $tmp.FullName -Raw
     Remove-Item $tmp.FullName -Force

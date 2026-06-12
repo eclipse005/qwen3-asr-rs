@@ -1,8 +1,9 @@
-//! Raw on-disk tensor view, loaded directly from safetensors — no burn dependency.
+//! Raw on-disk tensor view, loaded directly from safetensors bytes.
 //!
-//! This replaces `burn::tensor::TensorData` for our weight-loading needs. We never
-//! use these as GPU/CPU computation tensors (those live in `cudarc_engine` /
-//! `cpu_engine`); `RawTensor` is purely a deserialization intermediate.
+//! Used only for weight loading — never as a GPU/CPU computation tensor (those
+//! live in `cudarc_engine` / `cpu_engine`).  `RawTensor` is a deserialization
+//! intermediate; the engines consume the raw bytes and upload them to their
+//! respective devices.
 
 use anyhow::{anyhow, Result};
 use safetensors::Dtype;

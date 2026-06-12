@@ -1443,7 +1443,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "qwen3-asr-burn"
+name = "qwen3-asr"
 version = "0.2.2"
 dependencies = [
  "anyhow",

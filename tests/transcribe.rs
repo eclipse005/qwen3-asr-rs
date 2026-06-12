@@ -1,6 +1,6 @@
 //! CUDA f16 transcribe benchmarks — correctness + RTFx timing.
 //!
-//! Run: cargo test --release --test transcribe_burn -- --ignored --nocapture
+//! Run: cargo test --release --test transcribe -- --ignored --nocapture
 //!
 //! Each test loads a Qwen3-ASR checkpoint via `Backend::best()` (CUDA by default) and
 //! runs end-to-end transcribe on a fixture, asserting transcript sanity and logging
@@ -41,14 +41,14 @@ fn test_q06_sample1() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true).try_init();
 
-    let backend = qwen3_asr_burn::Backend::best().expect("best backend");
-    let engine = qwen3_asr_burn::AsrInference::load(
+    let backend = qwen3_asr::Backend::best().expect("best backend");
+    let engine = qwen3_asr::AsrInference::load(
         std::path::Path::new(&model_dir_06()), backend,
     ).expect("load 0.6B");
 
     let result = engine.transcribe(
         &fixture("sample1.wav"),
-        qwen3_asr_burn::TranscribeOptions::default(),
+        qwen3_asr::TranscribeOptions::default(),
     ).expect("transcribe");
 
     println!("Language : {}", result.language);
@@ -70,15 +70,15 @@ fn test_q06_15s() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true).try_init();
 
-    let backend = qwen3_asr_burn::Backend::best().expect("best backend");
-    let engine = qwen3_asr_burn::AsrInference::load(
+    let backend = qwen3_asr::Backend::best().expect("best backend");
+    let engine = qwen3_asr::AsrInference::load(
         std::path::Path::new(&model_dir_06()), backend,
     ).expect("load 0.6B");
 
     let t0 = Instant::now();
     let result = engine.transcribe(
         &fixture("15s.wav"),
-        qwen3_asr_burn::TranscribeOptions::default(),
+        qwen3_asr::TranscribeOptions::default(),
     ).expect("transcribe");
     let elapsed = t0.elapsed().as_secs_f32();
     let rtfx = 15.0 / elapsed;
@@ -95,15 +95,15 @@ fn test_q06_30s() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true).try_init();
 
-    let backend = qwen3_asr_burn::Backend::best().expect("best backend");
-    let engine = qwen3_asr_burn::AsrInference::load(
+    let backend = qwen3_asr::Backend::best().expect("best backend");
+    let engine = qwen3_asr::AsrInference::load(
         std::path::Path::new(&model_dir_06()), backend,
     ).expect("load 0.6B");
 
     let t0 = Instant::now();
     let result = engine.transcribe(
         &fixture("30s.wav"),
-        qwen3_asr_burn::TranscribeOptions::default(),
+        qwen3_asr::TranscribeOptions::default(),
     ).expect("transcribe");
     let elapsed = t0.elapsed().as_secs_f32();
     let rtfx = 30.0 / elapsed;
@@ -120,15 +120,15 @@ fn test_q17_15s() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true).try_init();
 
-    let backend = qwen3_asr_burn::Backend::best().expect("best backend");
-    let engine = qwen3_asr_burn::AsrInference::load(
+    let backend = qwen3_asr::Backend::best().expect("best backend");
+    let engine = qwen3_asr::AsrInference::load(
         std::path::Path::new(&model_dir_17()), backend,
     ).expect("load 1.7B");
 
     let t0 = Instant::now();
     let result = engine.transcribe(
         &fixture("15s.wav"),
-        qwen3_asr_burn::TranscribeOptions::default(),
+        qwen3_asr::TranscribeOptions::default(),
     ).expect("transcribe");
     let elapsed = t0.elapsed().as_secs_f32();
     let rtfx = 15.0 / elapsed;
@@ -145,15 +145,15 @@ fn test_q17_30s() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true).try_init();
 
-    let backend = qwen3_asr_burn::Backend::best().expect("best backend");
-    let engine = qwen3_asr_burn::AsrInference::load(
+    let backend = qwen3_asr::Backend::best().expect("best backend");
+    let engine = qwen3_asr::AsrInference::load(
         std::path::Path::new(&model_dir_17()), backend,
     ).expect("load 1.7B");
 
     let t0 = Instant::now();
     let result = engine.transcribe(
         &fixture("30s.wav"),
-        qwen3_asr_burn::TranscribeOptions::default(),
+        qwen3_asr::TranscribeOptions::default(),
     ).expect("transcribe");
     let elapsed = t0.elapsed().as_secs_f32();
     let rtfx = 30.0 / elapsed;
@@ -169,14 +169,14 @@ fn test_q17_30s() {
 fn test_q06_90s() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true).try_init();
-    let backend = qwen3_asr_burn::Backend::best().expect("best backend");
-    let engine = qwen3_asr_burn::AsrInference::load(
+    let backend = qwen3_asr::Backend::best().expect("best backend");
+    let engine = qwen3_asr::AsrInference::load(
         std::path::Path::new(&model_dir_06()), backend,
     ).expect("load 0.6B");
     let t0 = std::time::Instant::now();
     let result = engine.transcribe(
         &fixture("90s.wav"),
-        qwen3_asr_burn::TranscribeOptions::default(),
+        qwen3_asr::TranscribeOptions::default(),
     ).expect("transcribe");
     let elapsed = t0.elapsed().as_secs_f32();
     println!("0.6B-90s | {:.3}s elapsed | RTFx {:.2}x", elapsed, 90.0 / elapsed);
@@ -189,14 +189,14 @@ fn test_q06_90s() {
 fn test_q06_89s_ja() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true).try_init();
-    let backend = qwen3_asr_burn::Backend::best().expect("best backend");
-    let engine = qwen3_asr_burn::AsrInference::load(
+    let backend = qwen3_asr::Backend::best().expect("best backend");
+    let engine = qwen3_asr::AsrInference::load(
         std::path::Path::new(&model_dir_06()), backend,
     ).expect("load 0.6B");
     let t0 = std::time::Instant::now();
     let result = engine.transcribe(
         &fixture("ja_89s.wav"),
-        qwen3_asr_burn::TranscribeOptions::default().with_max_new_tokens(1024),
+        qwen3_asr::TranscribeOptions::default().with_max_new_tokens(1024),
     ).expect("transcribe");
     let elapsed = t0.elapsed().as_secs_f32();
     println!("0.6B-89s_ja | {:.3}s elapsed | RTFx {:.2}x", elapsed, 89.0 / elapsed);
@@ -210,14 +210,14 @@ fn test_q06_89s_ja() {
 fn test_q17_89s_ja() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true).try_init();
-    let backend = qwen3_asr_burn::Backend::best().expect("best backend");
-    let engine = qwen3_asr_burn::AsrInference::load(
+    let backend = qwen3_asr::Backend::best().expect("best backend");
+    let engine = qwen3_asr::AsrInference::load(
         std::path::Path::new(&model_dir_17()), backend,
     ).expect("load 1.7B");
     let t0 = std::time::Instant::now();
     let result = engine.transcribe(
         &fixture("ja_89s.wav"),
-        qwen3_asr_burn::TranscribeOptions::default().with_max_new_tokens(1024),
+        qwen3_asr::TranscribeOptions::default().with_max_new_tokens(1024),
     ).expect("transcribe");
     let elapsed = t0.elapsed().as_secs_f32();
     println!("1.7B-89s_ja | {:.3}s elapsed | RTFx {:.2}x", elapsed, 89.0 / elapsed);
@@ -231,14 +231,14 @@ fn test_q17_89s_ja() {
 fn test_q06_180s() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true).try_init();
-    let backend = qwen3_asr_burn::Backend::best().expect("best backend");
-    let engine = qwen3_asr_burn::AsrInference::load(
+    let backend = qwen3_asr::Backend::best().expect("best backend");
+    let engine = qwen3_asr::AsrInference::load(
         std::path::Path::new(&model_dir_06()), backend,
     ).expect("load 0.6B");
     let t0 = std::time::Instant::now();
     let result = engine.transcribe(
         &fixture("180s.wav"),
-        qwen3_asr_burn::TranscribeOptions::default().with_max_new_tokens(1024),
+        qwen3_asr::TranscribeOptions::default().with_max_new_tokens(1024),
     ).expect("transcribe");
     let elapsed = t0.elapsed().as_secs_f32();
     println!("0.6B-180s | {:.3}s elapsed | RTFx {:.2}x", elapsed, 180.0 / elapsed);
@@ -251,14 +251,14 @@ fn test_q06_180s() {
 fn test_q06_180s_en() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true).try_init();
-    let backend = qwen3_asr_burn::Backend::best().expect("best backend");
-    let engine = qwen3_asr_burn::AsrInference::load(
+    let backend = qwen3_asr::Backend::best().expect("best backend");
+    let engine = qwen3_asr::AsrInference::load(
         std::path::Path::new(&model_dir_06()), backend,
     ).expect("load 0.6B");
     let t0 = std::time::Instant::now();
     let result = engine.transcribe(
         &fixture("180s_en.wav"),
-        qwen3_asr_burn::TranscribeOptions::default().with_max_new_tokens(1024),
+        qwen3_asr::TranscribeOptions::default().with_max_new_tokens(1024),
     ).expect("transcribe");
     let elapsed = t0.elapsed().as_secs_f32();
     println!("0.6B-180s_en | {:.3}s elapsed | RTFx {:.2}x", elapsed, 180.0 / elapsed);
@@ -271,14 +271,14 @@ fn test_q06_180s_en() {
 fn test_q17_90s() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true).try_init();
-    let backend = qwen3_asr_burn::Backend::best().expect("best backend");
-    let engine = qwen3_asr_burn::AsrInference::load(
+    let backend = qwen3_asr::Backend::best().expect("best backend");
+    let engine = qwen3_asr::AsrInference::load(
         std::path::Path::new(&model_dir_17()), backend,
     ).expect("load 1.7B");
     let t0 = std::time::Instant::now();
     let result = engine.transcribe(
         &fixture("90s.wav"),
-        qwen3_asr_burn::TranscribeOptions::default().with_max_new_tokens(1024),
+        qwen3_asr::TranscribeOptions::default().with_max_new_tokens(1024),
     ).expect("transcribe");
     let elapsed = t0.elapsed().as_secs_f32();
     println!("1.7B-90s | {:.3}s elapsed | RTFx {:.2}x", elapsed, 90.0 / elapsed);
@@ -291,14 +291,14 @@ fn test_q17_90s() {
 fn test_q17_180s() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true).try_init();
-    let backend = qwen3_asr_burn::Backend::best().expect("best backend");
-    let engine = qwen3_asr_burn::AsrInference::load(
+    let backend = qwen3_asr::Backend::best().expect("best backend");
+    let engine = qwen3_asr::AsrInference::load(
         std::path::Path::new(&model_dir_17()), backend,
     ).expect("load 1.7B");
     let t0 = std::time::Instant::now();
     let result = engine.transcribe(
         &fixture("180s.wav"),
-        qwen3_asr_burn::TranscribeOptions::default().with_max_new_tokens(1024),
+        qwen3_asr::TranscribeOptions::default().with_max_new_tokens(1024),
     ).expect("transcribe");
     let elapsed = t0.elapsed().as_secs_f32();
     println!("1.7B-180s | {:.3}s elapsed | RTFx {:.2}x", elapsed, 180.0 / elapsed);
@@ -311,14 +311,14 @@ fn test_q17_180s() {
 fn test_q17_180s_en() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true).try_init();
-    let backend = qwen3_asr_burn::Backend::best().expect("best backend");
-    let engine = qwen3_asr_burn::AsrInference::load(
+    let backend = qwen3_asr::Backend::best().expect("best backend");
+    let engine = qwen3_asr::AsrInference::load(
         std::path::Path::new(&model_dir_17()), backend,
     ).expect("load 1.7B");
     let t0 = std::time::Instant::now();
     let result = engine.transcribe(
         &fixture("180s_en.wav"),
-        qwen3_asr_burn::TranscribeOptions::default().with_max_new_tokens(1024),
+        qwen3_asr::TranscribeOptions::default().with_max_new_tokens(1024),
     ).expect("transcribe");
     let elapsed = t0.elapsed().as_secs_f32();
     println!("1.7B-180s_en | {:.3}s elapsed | RTFx {:.2}x", elapsed, 180.0 / elapsed);
