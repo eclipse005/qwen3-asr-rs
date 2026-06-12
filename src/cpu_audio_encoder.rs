@@ -275,17 +275,21 @@ impl CpuConvStem {
             );
         }
 
-        // Add bias and GELU. out is [c_out, col_count] but we want [b, c_out, h_out, w_out].
+        // Add bias and GELU. out is [c_out, col_count] (one per-channel conv output per col,
+        // since im2col only fills the ic_in slot matching the col's channel — no implicit sum
+        // over input channels). We must sum over ic_in to get the full conv2d output, then add
+        // bias once per (ib, oc, ho, wo).
         let mut out4d = vec![0.0f32; b * c_out * h_out * w_out];
         for ib in 0..b {
-            for ic_in in 0..c_in {
-                for ho in 0..h_out {
-                    for wo in 0..w_out {
-                        let col = ((ib * c_in + ic_in) * h_out + ho) * w_out + wo;
-                        for oc in 0..c_out {
-                            let v = out[oc * col_count + col] + w_b[oc];
-                            out4d[((ib * c_out + oc) * h_out + ho) * w_out + wo] = v;
+            for ho in 0..h_out {
+                for wo in 0..w_out {
+                    for oc in 0..c_out {
+                        let mut v = w_b[oc];
+                        for ic_in in 0..c_in {
+                            let col = ((ib * c_in + ic_in) * h_out + ho) * w_out + wo;
+                            v += out[oc * col_count + col];
                         }
+                        out4d[((ib * c_out + oc) * h_out + ho) * w_out + wo] = v;
                     }
                 }
             }
