@@ -182,7 +182,7 @@ fn test_q06_90s() {
 
 #[test]
 #[ignore]
-fn test_q06_90s_ja() {
+fn test_q06_89s_ja() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true).try_init();
     let device = qwen3_asr_burn::best_device();
@@ -191,11 +191,11 @@ fn test_q06_90s_ja() {
     ).expect("load 0.6B");
     let t0 = std::time::Instant::now();
     let result = engine.transcribe(
-        &fixture("90s_ja.wav"),
+        &fixture("ja_89s.wav"),
         qwen3_asr_burn::TranscribeOptions::default().with_max_new_tokens(1024),
     ).expect("transcribe");
     let elapsed = t0.elapsed().as_secs_f32();
-    println!("0.6B-90s_ja | {:.3}s elapsed | RTFx {:.2}x", elapsed, 90.0 / elapsed);
+    println!("0.6B-89s_ja | {:.3}s elapsed | RTFx {:.2}x", elapsed, 89.0 / elapsed);
     println!("Language : {}", result.language);
     println!("Text: {}", result.text);
     assert!(!result.text.is_empty());
@@ -203,7 +203,7 @@ fn test_q06_90s_ja() {
 
 #[test]
 #[ignore]
-fn test_q17_90s_ja() {
+fn test_q17_89s_ja() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true).try_init();
     let device = qwen3_asr_burn::best_device();
@@ -212,11 +212,11 @@ fn test_q17_90s_ja() {
     ).expect("load 1.7B");
     let t0 = std::time::Instant::now();
     let result = engine.transcribe(
-        &fixture("90s_ja.wav"),
+        &fixture("ja_89s.wav"),
         qwen3_asr_burn::TranscribeOptions::default().with_max_new_tokens(1024),
     ).expect("transcribe");
     let elapsed = t0.elapsed().as_secs_f32();
-    println!("1.7B-90s_ja | {:.3}s elapsed | RTFx {:.2}x", elapsed, 90.0 / elapsed);
+    println!("1.7B-89s_ja | {:.3}s elapsed | RTFx {:.2}x", elapsed, 89.0 / elapsed);
     println!("Language : {}", result.language);
     println!("Text: {}", result.text);
     assert!(!result.text.is_empty());
