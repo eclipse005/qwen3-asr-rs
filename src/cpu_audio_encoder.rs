@@ -20,7 +20,7 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 
 use crate::config::AudioEncoderConfig;
-use crate::cpu_engine::{linear, CpuTensor, CpuWeight, CpuWeightF16};
+use crate::cpu_engine::{linear, CpuTensor, CpuWeightF16};
 use crate::raw_tensor::RawTensor;
 
 // ─── Linear + LayerNorm primitives ─────────────────────────────────
@@ -160,6 +160,7 @@ pub(crate) fn im2col_3x3_s2p1(x: &[f32], b: usize, c_in: usize, h: usize, w: usi
     (cols, h_out, w_out)
 }
 
+#[allow(dead_code)]
 pub(crate) struct CpuConvStem {
     c1_w: CpuWeightF16, c1_b: Vec<f32>,
     c2_w: CpuWeightF16, c2_b: Vec<f32>,

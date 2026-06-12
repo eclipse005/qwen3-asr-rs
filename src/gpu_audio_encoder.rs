@@ -187,6 +187,7 @@ impl GpuAudioLayer {
 
 // ─── Audio encoder transformer (post conv-stem) ────────────────────
 
+#[allow(dead_code)]
 pub(crate) struct GpuConvStem {
     c1_w: CudaSlice<f16>, c1_b: CudaSlice<f16>,
     c2_w: CudaSlice<f16>, c2_b: CudaSlice<f16>,
@@ -403,6 +404,7 @@ impl GpuAudioEncoder {
     /// Run the transformer stack on pre-computed conv output [n_tokens, d_model].
     /// Skips the conv stem; caller uploads the [n_tokens, d_model] tensor.
     /// Currently unused — kept for future streaming work (see ROADMAP.md §3.5).
+    #[allow(dead_code)]
     pub fn run_transformer(&self, conv_out: &[f16], n_tokens: usize) -> Result<(Vec<f16>, usize)> {
         let dm = self.config.d_model;
         let cs = self.config.n_window * 2;

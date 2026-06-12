@@ -38,11 +38,6 @@ impl CpuTensor {
         assert_eq!(data.len(), expected, "CpuTensor len mismatch (shape {:?})", shape);
         Self { data, shape }
     }
-    pub fn zeros(shape: Vec<usize>) -> Self {
-        let n: usize = shape.iter().product();
-        Self { data: vec![0.0; n], shape }
-    }
-    pub fn shape(&self) -> &[usize] { &self.shape }
     pub fn numel(&self) -> usize { self.data.len() }
     pub fn reshape(mut self, shape: Vec<usize>) -> Self {
         assert_eq!(self.numel(), shape.iter().product::<usize>());
@@ -106,22 +101,6 @@ pub(crate) fn linear(x: &CpuTensor, w: &CpuWeight) -> CpuTensor {
     let mut out = vec![0.0f32; m * n];
     gemm_row_major(&mut out, &x.data, w, m, 0.0);
     CpuTensor::new(out, out_shape)
-}
-
-fn linear_accum(out: &mut CpuTensor, x: &CpuTensor, w: &CpuWeight) {
-    let nd = x.shape.len();
-    let m: usize = x.shape[..nd - 1].iter().product();
-    let k = x.shape[nd - 1];
-    let n = w.rows;
-    assert_eq!(k, w.cols);
-    assert_eq!(out.numel(), m * n);
-    // m=1: accumulate via hand-written GEMV.
-    if m == 1 {
-        let add = linear_gemv(&x.data, w);
-        for (o, a) in out.data.iter_mut().zip(add.iter()) { *o += *a; }
-        return;
-    }
-    gemm_row_major(&mut out.data, &x.data, w, m, 1.0);
 }
 
 // ─── f16-weight variants (decode: direct f16 read; prefill: convert to f32) ────
@@ -271,31 +250,6 @@ pub fn rms_norm(x: &CpuTensor, w: &[f32], eps: f32) -> CpuTensor {
     CpuTensor::new(out, x.shape.clone())
 }
 
-/// residual += add_in (in place); returns rms_norm(residual, w).  Saves a pass over memory.
-pub fn add_residual_rms_norm(residual: &mut CpuTensor, add_in: &CpuTensor, w: &[f32], eps: f32) -> CpuTensor {
-    let nd = residual.shape.len();
-    let last = residual.shape[nd - 1];
-    let outer: usize = residual.shape[..nd - 1].iter().product();
-    let mut out = vec![0.0f32; outer * last];
-    residual.data
-        .par_chunks_mut(last)
-        .zip(add_in.data.par_chunks(last))
-        .zip(out.par_chunks_mut(last))
-        .for_each(|((r, a), o)| {
-            let mut ss = 0.0f64;
-            for j in 0..last {
-                let v = r[j] + a[j];
-                r[j] = v;
-                ss += (v as f64) * (v as f64);
-            }
-            let inv_rms = 1.0 / ((ss / last as f64 + eps as f64).sqrt() as f32);
-            for j in 0..last {
-                o[j] = r[j] * inv_rms * w[j];
-            }
-        });
-    CpuTensor::new(out, residual.shape.clone())
-}
-
 /// out = silu(gate) * up where gu = [gate | up] along last dim.  gu: [outer, 2*inter] → out: [outer, inter].
 pub fn silu_mul_split(gu: &CpuTensor) -> CpuTensor {
     let nd = gu.shape.len();
@@ -316,20 +270,6 @@ pub fn silu_mul_split(gu: &CpuTensor) -> CpuTensor {
     let mut shape = gu.shape.clone();
     shape[nd - 1] = inter;
     CpuTensor::new(out, shape)
-}
-
-/// Embedding lookup.  ids: [n], table: [vocab, d] → out [n, d].
-pub fn embed_lookup(table: &CpuWeight, ids: &[i64]) -> CpuTensor {
-    let n = ids.len();
-    let d = table.cols;
-    let mut out = vec![0.0f32; n * d];
-    out.par_chunks_mut(d)
-        .zip(ids.par_iter())
-        .for_each(|(o, &id)| {
-            let src = &table.data[(id as usize) * d..(id as usize + 1) * d];
-            o.copy_from_slice(src);
-        });
-    CpuTensor::new(out, vec![n, d])
 }
 
 /// Embedding lookup from f16 table — converts each row to f32 on the fly.
@@ -642,7 +582,7 @@ fn prefill_attention(
     let s = q.shape[2];
     let n_rep = nqh / nkvh;
     let scale = 1.0f32 / (hd as f32).sqrt();
-    let mut out = vec![0.0f32; b * s * nqh * hd];
+    let out = vec![0.0f32; b * s * nqh * hd];
 
     // Each rayon job handles one (b, qh) — it owns a strided view of the output (length s*hd).
     // We compute scores [s, cur_len], softmax, then matmul with V to produce out[ib, :, qh, :].
@@ -710,27 +650,11 @@ fn prefill_attention(
     CpuTensor::new(out, vec![b, nqh, s, hd])
 }
 
-/// Swap dims 1 and 2 of a 4D tensor: [d0, d1, d2, d3] → [d0, d2, d1, d3].
-pub fn swap_dims_12(x: &CpuTensor) -> CpuTensor {
-    assert_eq!(x.shape.len(), 4);
-    let (d0, d1, d2, d3) = (x.shape[0], x.shape[1], x.shape[2], x.shape[3]);
-    let mut out = vec![0.0f32; x.numel()];
-    for i0 in 0..d0 {
-        for i2 in 0..d2 {
-            for i1 in 0..d1 {
-                let src_off = ((i0 * d1 + i1) * d2 + i2) * d3;
-                let dst_off = ((i0 * d2 + i2) * d1 + i1) * d3;
-                out[dst_off..dst_off + d3].copy_from_slice(&x.data[src_off..src_off + d3]);
-            }
-        }
-    }
-    CpuTensor::new(out, vec![d0, d2, d1, d3])
-}
-
 // ═══════════════════════════════════════════════════════════════════════
 //  KV cache
 // ═══════════════════════════════════════════════════════════════════════
 
+#[allow(dead_code)]
 pub(crate) struct CpuKvCache {
     pub k: Vec<Vec<f32>>,  // per layer: [b, nkvh, max_seq, hd]
     pub v: Vec<Vec<f32>>,
@@ -758,6 +682,7 @@ impl CpuKvCache {
 //  Text decoder
 // ═══════════════════════════════════════════════════════════════════════
 
+#[allow(dead_code)]
 pub(crate) struct CpuTextDecoder {
     pub embed_table: CpuWeightF16,   // [vocab, hidden] (reused as lm_head)
     pub layers: Vec<CpuDecoderLayer>,

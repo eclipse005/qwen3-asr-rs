@@ -40,13 +40,11 @@ impl GpuTensor {
     }
     pub fn shape(&self) -> &[usize] { &self.shape }
     pub fn numel(&self) -> usize { self.data.len() }
-    pub fn data(&self) -> &CudaSlice<f16> { &self.data }
     /// Reshape without moving data.
     pub fn reshape(&self, shape: Vec<usize>) -> Self {
         assert_eq!(self.data.len(), shape.iter().product::<usize>());
         Self { data: self.data.clone(), shape }
     }
-    pub fn into_parts(self) -> (CudaSlice<f16>, Vec<usize>) { (self.data, self.shape) }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -65,24 +63,13 @@ impl CpuTensor {
         assert_eq!(data.len(), expected, "CpuTensor len mismatch");
         Self { data, shape }
     }
-    pub fn reshape(&self, shape: Vec<usize>) -> Self {
-        assert_eq!(self.data.len(), shape.iter().product::<usize>());
-        Self { data: self.data.clone(), shape }
-    }
-    pub fn slice_first_dim(&self, start: usize, end: usize) -> Self {
-        assert!(end <= self.shape[0] && start <= end);
-        let row_size: usize = self.shape[1..].iter().product();
-        let mut s = self.shape.clone();
-        s[0] = end - start;
-        let base = start * row_size;
-        Self::new(self.data[base..base + (end - start) * row_size].to_vec(), s)
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
 //  CudaState — context, stream, cuBLAS handle, kernel registry
 // ═══════════════════════════════════════════════════════════════════════
 
+#[allow(dead_code)]
 pub(crate) struct CudaKernels {
     pub rms_norm: CudaFunction,
     pub add_residual_rms_norm: CudaFunction,
@@ -205,9 +192,6 @@ impl CudaState {
     pub fn alloc_uninit_f16(&self, n: usize) -> Result<CudaSlice<f16>> {
         Ok(unsafe { self.stream.alloc::<f16>(n)? })
     }
-    pub fn alloc_zeros_i32(&self, n: usize) -> Result<CudaSlice<i32>> {
-        Ok(self.stream.alloc_zeros::<i32>(n)?)
-    }
     /// Allocate uninitialized i32 — same semantics as `alloc_uninit_f16`.
     pub fn alloc_uninit_i32(&self, n: usize) -> Result<CudaSlice<i32>> {
         Ok(unsafe { self.stream.alloc::<i32>(n)? })
@@ -231,13 +215,6 @@ impl CudaState {
     pub fn synchronize(&self) -> Result<()> {
         self.stream.synchronize()?;
         Ok(())
-    }
-
-    /// Device→device clone of a GpuTensor (one memcpy, no kernel launch).
-    pub fn clone_tensor(&self, x: &GpuTensor) -> Result<GpuTensor> {
-        let mut out = self.alloc_uninit_f16(x.numel())?;
-        self.stream.memcpy_dtod(&x.data, &mut out)?;
-        Ok(GpuTensor::new(out, x.shape().to_vec()))
     }
 }
 
@@ -295,15 +272,6 @@ impl CudaState {
             )?;
         }
         Ok(())
-    }
-
-    /// y = residual_in + x @ W^T  — copies residual_in into a fresh buffer then accumulates via cuBLAS beta=1.
-    /// One memcpy_dtod (no launch overhead) + one cuBLAS GEMM, vs separate clone + linear_gpu_accum
-    /// which has the same cost but two visible calls; this version just centralizes the pattern.
-    pub fn linear_residual(&self, residual_in: &GpuTensor, x: &GpuTensor, w: &GpuWeight) -> Result<GpuTensor> {
-        let mut y = self.clone_tensor(residual_in)?;
-        self.linear_gpu_accum(&mut y, x, w)?;
-        Ok(y)
     }
 
     /// scores = Q @ K^T  (Q: [b,h,m,d], K: [b,h,n,d] → [b,h,m,n])
@@ -376,6 +344,7 @@ fn block_for_reduction(last: usize) -> u32 {
     bs.min(1024).max(32)
 }
 
+#[allow(dead_code)]
 impl CudaState {
     pub fn rms_norm(&self, x: &GpuTensor, w: &CudaSlice<f16>, eps: f32) -> Result<GpuTensor> {
         let nd = x.shape().len();
@@ -1024,6 +993,7 @@ pub(crate) struct GpuWeight {
 //  KV cache (GPU-resident, pre-allocated)
 // ═══════════════════════════════════════════════════════════════════════
 
+#[allow(dead_code)]
 pub(crate) struct GpuKvCache {
     pub k: Vec<CudaSlice<f16>>,   // per layer: [b, nkvh, max_seq, d]
     pub v: Vec<CudaSlice<f16>>,
@@ -1072,11 +1042,6 @@ fn get_weight_f16(weights: &HashMap<String, RawTensor>, name: &str) -> Result<(V
     Ok((data_f16, shape))
 }
 
-fn load_cpu_tensor(weights: &HashMap<String, RawTensor>, name: &str) -> Result<CpuTensor> {
-    let (data_f16, shape) = get_weight_f16(weights, name)?;
-    Ok(CpuTensor::new(data_f16, shape))
-}
-
 fn load_fused_qkv_weight(
     weights: &HashMap<String, RawTensor>, prefix: &str, cuda: &CudaState,
 ) -> Result<(GpuWeight, usize, usize)> {
@@ -1109,6 +1074,7 @@ fn load_fused_gate_up_weight(
 //  DecodeScratch — pre-allocated temp buffers for the decode hot loop
 // ═══════════════════════════════════════════════════════════════════════
 
+#[allow(dead_code)]
 pub(crate) struct DecodeScratch {
     // Per-layer temporaries (reused across layers since they run sequentially)
     pub norm1: CudaSlice<f16>,           // [hidden_size]
@@ -1175,14 +1141,6 @@ impl DecodeScratch {
 // ═══════════════════════════════════════════════════════════════════════
 
 impl CudaState {
-    /// rms_norm writing into a pre-allocated `out` buffer.  `out` must have `outer * last` f16 elements.
-    pub fn rms_norm_into(&self, x: &GpuTensor, w: &CudaSlice<f16>, eps: f32, out: &mut CudaSlice<f16>) -> Result<()> {
-        let nd = x.shape().len();
-        let last = x.shape()[nd - 1];
-        let outer: usize = x.shape()[..nd - 1].iter().product();
-        self.rms_norm_into_flat(&x.data, last, outer, w, eps, out)
-    }
-
     /// rms_norm on a flat buffer — no GpuTensor wrapper, no D2D clone.
     /// CUDA Graph–safe (no cuMemcpyDtD).
     pub fn rms_norm_into_flat(&self, x: &CudaSlice<f16>, last: usize, outer: usize, w: &CudaSlice<f16>, eps: f32, out: &mut CudaSlice<f16>) -> Result<()> {
@@ -1193,14 +1151,6 @@ impl CudaState {
         b.arg(out); b.arg(x); b.arg(w); b.arg(&last_i); b.arg(&outer_i); b.arg(&eps);
         unsafe { b.launch(cfg) }?;
         Ok(())
-    }
-
-    /// linear_gpu writing into a pre-allocated `out` buffer.
-    pub fn linear_gpu_into(&self, x: &GpuTensor, w: &GpuWeight, out: &mut CudaSlice<f16>) -> Result<()> {
-        let nd = x.shape().len();
-        let m: usize = x.shape()[..nd - 1].iter().product();
-        let k = x.shape()[nd - 1];
-        self.linear_gpu_into_flat(&x.data, m, k, w, out)
     }
 
     /// linear_gpu on a flat buffer — no GpuTensor wrapper, no D2D clone.
@@ -1259,24 +1209,6 @@ impl CudaState {
         bb.arg(&b_i); bb.arg(&nqh_i); bb.arg(&nkvh_i); bb.arg(&sl_i); bb.arg(&d_i); bb.arg(&tot_i);
         bb.arg(&q_i); bb.arg(&kv_i);
         bb.arg(&max_i); bb.arg(&start_i); bb.arg(&po); bb.arg(&eps);
-        unsafe { bb.launch(cfg) }?;
-        Ok(())
-    }
-
-    /// fused_gqa_decode writing into a pre-allocated `out` buffer.
-    pub fn fused_gqa_decode_into(&self, q: &CudaSlice<f16>,
-        k_cache: &CudaSlice<f16>, v_cache: &CudaSlice<f16>,
-        nkvh: usize, max_seq: usize, cur_len: usize, scale: f32,
-        out: &mut CudaSlice<f16>,
-    ) -> Result<()> {
-        let bs: u32 = if cur_len > 1024 { 1024 } else if cur_len > 512 { 512 } else { 256 };
-        let t_chunks = (bs as usize / 128).max(1);
-        let smem_bytes = (cur_len + 128 * t_chunks) * 4;
-        let cfg = LaunchConfig { grid_dim: (16, 1, 1), block_dim: (bs, 1, 1), shared_mem_bytes: smem_bytes as u32 };
-        let nkvh_i = nkvh as i32; let max_i = max_seq as i32; let d_i = 128i32; let cur_i = cur_len as i32;
-        let mut bb = self.stream.launch_builder(&self.k.fused_gqa_decode);
-        bb.arg(out); bb.arg(q); bb.arg(k_cache); bb.arg(v_cache);
-        bb.arg(&1i32); bb.arg(&16i32); bb.arg(&nkvh_i); bb.arg(&max_i); bb.arg(&d_i); bb.arg(&cur_i); bb.arg(&scale);
         unsafe { bb.launch(cfg) }?;
         Ok(())
     }
@@ -1354,6 +1286,7 @@ impl CudaState {
 //  Decoder Layer (GPU-resident)
 // ═══════════════════════════════════════════════════════════════════════
 
+#[allow(dead_code)]
 struct GpuDecoderLayer {
     iln_w: CudaSlice<f16>,
     pln_w: CudaSlice<f16>,
@@ -1532,6 +1465,7 @@ impl GpuDecoderLayer {
 //  Text Decoder
 // ═══════════════════════════════════════════════════════════════════════
 
+#[allow(dead_code)]
 pub(crate) struct GpuTextDecoder {
     pub embed_table: GpuWeight,        // [vocab, hidden]  (also reused as lm_head)
     layers: Vec<GpuDecoderLayer>,
@@ -1557,34 +1491,9 @@ impl GpuTextDecoder {
         Ok(Self { embed_table, layers, norm_w, eps: config.rms_norm_eps as f32, config: config.clone(), cuda })
     }
 
-    pub fn load(weights: &HashMap<String, RawTensor>, prefix: &str, config: &TextDecoderConfig) -> Result<Self> {
-        let cuda = Arc::new(CudaState::new(0)?);
-        Self::load_with(cuda, weights, prefix, config)
-    }
-
     pub fn embed_ids(&self, ids: &[i64]) -> Result<GpuTensor> {
         let ids_gpu = self.cuda.upload_i64(ids)?;
         self.cuda.embed_lookup(&self.embed_table, &ids_gpu)
-    }
-
-    /// Single-token embed lookup whose id sits in a pre-allocated GPU i32 buffer.
-    /// Saves the htod upload + temporary alloc that `embed_ids(&[tok])` does each step
-    /// in the decode hot loop.  Returns shape [1, 1, hidden].
-    pub fn embed_id_from_gpu_slot(&self, token_buf: &CudaSlice<i32>, slot: usize) -> Result<GpuTensor> {
-        let d = self.embed_table.cols;
-        let mut out = self.cuda.alloc_uninit_f16(d)?;
-        let bs = (d as u32).min(1024);
-        let cfg = LaunchConfig {
-            grid_dim: (1, 1, 1),
-            block_dim: (bs, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let slot_i = slot as i32; let d_i = d as i32;
-        let mut bb = self.cuda.stream.launch_builder(&self.cuda.k.embed_lookup_single_i32);
-        bb.arg(&mut out); bb.arg(&self.embed_table.data); bb.arg(token_buf);
-        bb.arg(&slot_i); bb.arg(&d_i);
-        unsafe { bb.launch(cfg) }?;
-        Ok(GpuTensor::new(out, vec![1, 1, d]))
     }
 
     /// Forward pass.
@@ -1613,26 +1522,6 @@ impl GpuTextDecoder {
 
         // LM head (shared with embed_table)
         self.cuda.linear_gpu(&h, &self.embed_table)
-    }
-
-    /// Same as `forward` but for the **decode** path: runs all layers, final RMSNorm, then
-    /// the fused lm_head GEMV + argmax kernel in one launch, returning the next token id.
-    /// Saves one large alloc + one big linear_gpu + one separate argmax — used in the hot
-    /// decode loop where every microsecond matters.
-    pub fn forward_decode_argmax(&self, hs: GpuTensor, cos: &CudaSlice<f16>, sin: &CudaSlice<f16>,
-                                 kv: &mut GpuKvCache, kv_start: usize) -> Result<i32>
-    {
-        let sl = hs.shape()[1];
-        let mut h = hs;
-        for (i, layer) in self.layers.iter().enumerate() {
-            h = layer.forward(h, cos, sin, kv, i, kv_start, false, &self.cuda)?;
-        }
-        kv.cur_len = kv_start + sl;
-
-        let h = self.cuda.rms_norm(&h, &self.norm_w, self.eps)?;
-        // h shape: [1, sl, hidden]; for decode sl==1, the row is contiguous at offset 0.
-        // For prefill calling this method we'd need to slice last; decode path uses sl==1 so skip.
-        self.cuda.lm_head_argmax(&h, &self.embed_table)
     }
 
     /// Zero-alloc decode: runs all layers via scratch buffers, final norm + lm_head,

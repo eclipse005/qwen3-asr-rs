@@ -16,7 +16,7 @@ use crate::prompt;
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 #[cfg(feature = "cuda")]
-use crate::cudarc_engine::{GpuTextDecoder, GpuKvCache, CudaState,
+use crate::cudarc_engine::{GpuTextDecoder, CudaState,
     compute_mrope_cos_sin as cublas_compute_mrope_cos_sin};
 #[cfg(feature = "cuda")]
 use crate::gpu_audio_encoder::GpuAudioEncoder;
