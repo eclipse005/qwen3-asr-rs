@@ -325,3 +325,44 @@ fn test_q17_180s_en() {
     println!("Text: {}", result.text);
     assert!(!result.text.is_empty());
 }
+
+/// CUDA streaming visual demo — typewriter effect, 90s English.
+#[test]
+#[ignore]
+fn test_cuda_streaming_visual_90s() {
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .is_test(true).try_init();
+
+    let backend = qwen3_asr::Backend::best().expect("best backend");
+    let engine = qwen3_asr::AsrInference::load(
+        std::path::Path::new(&model_dir_06()), backend,
+    ).expect("load 0.6B");
+
+    let wav = fixture("90s.wav");
+    let options = qwen3_asr::TranscribeOptions::default();
+
+    println!("\n═══ CUDA Streaming 90s English (typewriter) ═══\n");
+
+    let mut prev = String::new();
+    let mut token_count = 0;
+    let t0 = Instant::now();
+
+    let result = engine.transcribe_streaming(&wav, options, |t| {
+        token_count += 1;
+        if let Some(delta) = t.text_so_far.strip_prefix(&prev) {
+            eprint!("{}", delta);
+            use std::io::Write;
+            std::io::stderr().flush().ok();
+        }
+        prev = t.text_so_far;
+    }).expect("streaming transcribe");
+
+    let elapsed = t0.elapsed().as_secs_f32();
+    eprintln!();
+
+    println!("\n═══ Done: {} tokens in {:.1}s | RTFx {:.1}x ═══",
+             token_count, elapsed, 90.0 / elapsed);
+    println!("Language: {}", result.language);
+    println!("Text:     {}", result.text);
+    assert!(!result.text.is_empty());
+}
