@@ -15,6 +15,7 @@
 
 use anyhow::Result;
 use gemm::{gemm, Parallelism};
+use rayon::prelude::*;
 use std::collections::HashMap;
 
 use crate::config::AudioEncoderConfig;
@@ -55,14 +56,10 @@ impl CpuAudioLinear {
     pub(crate) fn forward(&self, x: &CpuTensor) -> Result<CpuTensor> {
         let mut y = linear(x, &self.w);
         if let Some(b) = &self.bias {
-            let nd = y.shape.len();
-            let last = y.shape[nd - 1];
-            let outer: usize = y.shape[..nd - 1].iter().product();
-            for i in 0..outer {
-                for j in 0..last {
-                    y.data[i * last + j] += b[j];
-                }
-            }
+            let last = y.shape.last().unwrap();
+            y.data.par_chunks_mut(*last).for_each(|row| {
+                for j in 0..row.len() { row[j] += b[j]; }
+            });
         }
         Ok(y)
     }
@@ -93,69 +90,71 @@ impl CpuAudioLayerNorm {
 
     /// x: [outer, d] → [outer, d]  (LayerNorm over last dim)
     pub(crate) fn forward(&self, x: &CpuTensor) -> CpuTensor {
-        let nd = x.shape.len();
-        let d = x.shape[nd - 1];
-        let outer: usize = x.shape[..nd - 1].iter().product();
-        let mut out = vec![0.0f32; outer * d];
-        for i in 0..outer {
-            let row = &x.data[i * d..(i + 1) * d];
-            let mut mean = 0.0f32;
-            for &v in row { mean += v; }
-            mean /= d as f32;
-            let mut var = 0.0f32;
-            for &v in row { let d_ = v - mean; var += d_ * d_; }
-            var /= d as f32;
-            let inv_std = 1.0 / (var + self.eps).sqrt();
-            for j in 0..d {
-                out[i * d + j] = (row[j] - mean) * inv_std * self.w[j] + self.bias[j];
-            }
-        }
+        let d = *x.shape.last().unwrap();
+        let w = &self.w;
+        let bias = &self.bias;
+        let eps = self.eps;
+        let mut out = vec![0.0f32; x.data.len()];
+        out.par_chunks_mut(d)
+            .zip(x.data.par_chunks(d))
+            .for_each(|(o_row, x_row)| {
+                let mut mean = 0.0f32;
+                for &v in x_row { mean += v; }
+                mean /= d as f32;
+                let mut var = 0.0f32;
+                for &v in x_row { let d_ = v - mean; var += d_ * d_; }
+                var /= d as f32;
+                let inv_std = 1.0 / (var + eps).sqrt();
+                for j in 0..d {
+                    o_row[j] = (x_row[j] - mean) * inv_std * w[j] + bias[j];
+                }
+            });
         CpuTensor::new(out, x.shape.clone())
     }
 }
 
 /// In-place f32 GELU (tanh approximation, matching `cudarc::nn::gelu` default).
 pub(crate) fn gelu_inplace(x: &mut CpuTensor) {
-    for v in x.data.iter_mut() {
+    x.data.par_iter_mut().for_each(|v| {
         // 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
         let xf = *v;
         let inner = 0.7978845608_f32 * (xf + 0.044715_f32 * xf * xf * xf);
         *v = 0.5 * xf * (1.0 + inner.tanh());
-    }
+    });
 }
 
-/// im2col for a single conv2d layer with kernel=3, stride=2, pad=1.
-/// Input x: [b, c_in, h, w]   (h, w are 1 and T_mel initially).
-/// Output: [col_count, 3*3*c_in] row-major, where col_count = b * c_in * h_out * w_out
-///   with h_out = (h + 2 - 3) / 2 + 1, w_out = (w + 2 - 3) / 2 + 1.
+/// Standard im2col for conv2d(kernel=3, stride=2, pad=1).
+/// Input x: [b, c_in, h, w].
+/// Output: [col_count, c_in*9] row-major, where col_count = b * h_out * w_out.
+/// Column layout: col[ic*9 + kh*3 + kw] matches weight [c_out, c_in, 3, 3] flattened.
 pub(crate) fn im2col_3x3_s2p1(x: &[f32], b: usize, c_in: usize, h: usize, w: usize) -> (Vec<f32>, usize, usize) {
     let h_out = (h + 2 - 3) / 2 + 1;
     let w_out = (w + 2 - 3) / 2 + 1;
-    let col_count = b * c_in * h_out * w_out;
-    let mut cols = vec![0.0f32; col_count * 9 * c_in];
-    for ib in 0..b {
-        for ic in 0..c_in {
-            for ho in 0..h_out {
-                for wo in 0..w_out {
-                    let col_idx = ((ib * c_in + ic) * h_out + ho) * w_out + wo;
-                    let mut k = 0;
-                    for kh in 0..3 {
-                        for kw in 0..3 {
-                            let ih = (ho * 2 + kh) as isize - 1;
-                            let iw = (wo * 2 + kw) as isize - 1;
-                            let v = if ih < 0 || ih >= h as isize || iw < 0 || iw >= w as isize {
-                                0.0
-                            } else {
-                                x[((ib * c_in + ic) * h + ih as usize) * w + iw as usize]
-                            };
-                            cols[col_idx * 9 * c_in + k * c_in + ic] = v;
-                            k += 1;
-                        }
+    let col_count = b * h_out * w_out;
+    let k = c_in * 9;
+    let mut cols = vec![0.0f32; col_count * k];
+    cols.par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(col_idx, col)| {
+            let ib = col_idx / (h_out * w_out);
+            let rem = col_idx % (h_out * w_out);
+            let ho = rem / w_out;
+            let wo = rem % w_out;
+            for ic in 0..c_in {
+                for kh in 0..3 {
+                    for kw in 0..3 {
+                        let ih = (ho * 2 + kh) as isize - 1;
+                        let iw = (wo * 2 + kw) as isize - 1;
+                        let v = if ih < 0 || ih >= h as isize || iw < 0 || iw >= w as isize {
+                            0.0
+                        } else {
+                            unsafe { *x.get_unchecked(((ib * c_in + ic) * h + ih as usize) * w + iw as usize) }
+                        };
+                        col[ic * 9 + kh * 3 + kw] = v;
                     }
                 }
             }
-        }
-    }
+        });
     (cols, h_out, w_out)
 }
 
@@ -199,59 +198,69 @@ impl CpuConvStem {
         Ok(Self { c1_w, c1_b, c2_w, c2_b, c3_w, c3_b, co, pe, d_model: dm, max_pos })
     }
 
-    /// mel: [n_mels * T_mel] flat. Returns [n_total, d_model] flat.
+    /// Run conv stem on chunked mel input.
+    /// mel_chunks: [b_chunks * n_mels * cs] in (chunk, mel_bin, frame) order.
+    /// Layout matches GPU: [b_chunks, c=1, h=n_mels, w=cs] in NCHW.
+    /// Returns ([b_chunks * t2 * d_model], t2).
     pub(crate) fn forward(
         &self,
-        mel: &[f32],
+        mel_chunks: &[f32],
+        b_chunks: usize,
         n_mels: usize,
-        mel_len: usize,
+        cs: usize,
     ) -> Result<(Vec<f32>, usize)> {
-        // 1. Pack mel into [1, n_mels, 1, T_mel] (4D, batch=1, h=1).
-        let h_in = 1usize;
-        let w_in = mel_len;
-        let c_in = n_mels;
-        let x4d: Vec<f32> = mel.to_vec();
+        let c1_out = self.c1_w.rows;
+        let c2_out = self.c2_w.rows;
 
-        // 2. Three conv2d (kernel=3, stride=2, pad=1) with bias + GELU.
-        let (x1, h1, w1) = self.conv_block(&x4d, 1, c_in, h_in, w_in, &self.c1_w, &self.c1_b)?;
-        let (x2, h2, w2) = self.conv_block(&x1, 1, c_in, h1, w1, &self.c2_w, &self.c2_b)?;
-        let (x3, h3, w3) = self.conv_block(&x2, 1, c_in, h2, w2, &self.c3_w, &self.c3_b)?;
-        // x3: [1, c_in(=c_out=128), h3=1, w3 = T_mel/8]
+        // Three conv2d (kernel=3, stride=2, pad=1) with bias + GELU.
+        // Input: [b_chunks, 1, n_mels, cs] — 1 channel, n_mels height, cs width.
+        let (x1, h1, w1) = self.conv_block(mel_chunks, b_chunks, 1, n_mels, cs, &self.c1_w, &self.c1_b)?;
+        let (x2, h2, w2) = self.conv_block(&x1, b_chunks, c1_out, h1, w1, &self.c2_w, &self.c2_b)?;
+        let (x3, h3, w3) = self.conv_block(&x2, b_chunks, c2_out, h2, w2, &self.c3_w, &self.c3_b)?;
+        // x3: [b_chunks, c3_out, h3, w3]
         let t2 = w3;
 
-        // 3. Permute [b, c, f, t] → [b, t, c, f] then reshape [b, t, c*f].
-        //    Source layout: [1, 128, 1, t2]  →  [1, t2, 128*1] = [1, t2, 128]
-        let c2 = c_in;       // 128
-        let f2 = h3;         // 1
-        let mut perm = vec![0.0f32; t2 * c2 * f2];
-        for it in 0..t2 {
-            for ic in 0..c2 {
-                for f in 0..f2 {
-                    let src = (ic * f2 + f) * t2 + it;
-                    let dst = (it * c2 + ic) * f2 + f;
-                    perm[dst] = x3[src];
+        // Permute [b, c, f, t] → [b, t, c, f] then reshape [b, t, c*f].
+        let c_dim = self.c3_w.rows;
+        let f_dim = h3;
+        let row_len = c_dim * f_dim;
+        let mut perm = vec![0.0f32; b_chunks * t2 * c_dim * f_dim];
+        perm.par_chunks_mut(row_len)
+            .enumerate()
+            .for_each(|(idx, chunk)| {
+                let ib = idx / t2;
+                let it = idx % t2;
+                for ic in 0..c_dim {
+                    for f in 0..f_dim {
+                        let src = ((ib * c_dim + ic) * f_dim + f) * t2 + it;
+                        let dst = ic * f_dim + f;
+                        chunk[dst] = x3[src];
+                    }
                 }
-            }
-        }
+            });
 
-        // 4. ConvOut (Linear) + bias → [1, t2, d_model]
-        let perm_t = CpuTensor::new(perm, vec![1, t2, c2 * f2]);
+        // ConvOut (Linear): [b, t2, c*f] → [b, t2, d_model]
+        let perm_t = CpuTensor::new(perm, vec![b_chunks, t2, c_dim * f_dim]);
         let co_out = self.co.forward(&perm_t)?;
-        // co_out: [1, t2, d_model]
 
-        // 5. Add PE (broadcast over batch). PE is indexed by t.
+        // Add PE (broadcast over batch).
         let mut out = co_out.data.clone();
         let dm = self.d_model;
-        for it in 0..t2 {
-            for j in 0..dm {
-                out[it * dm + j] += self.pe[it * dm + j];
-            }
-        }
+        let pe = &self.pe;
+        out.par_chunks_mut(dm)
+            .enumerate()
+            .for_each(|(idx, chunk)| {
+                let it = idx % t2;
+                let pe_base = it * dm;
+                for j in 0..dm {
+                    chunk[j] += pe[pe_base + j];
+                }
+            });
         Ok((out, t2))
     }
 
     /// Single conv2d (3×3, stride 2, pad 1) + bias + GELU.
-    /// Returns (flat out [b, c_out, h_out, w_out], h_out, w_out).
+    /// Input x: [b, c_in, h, w]. Returns (flat [b, c_out, h_out, w_out], h_out, w_out).
     fn conv_block(
         &self,
         x: &[f32],
@@ -259,9 +268,13 @@ impl CpuConvStem {
         w_w: &CpuWeight, w_b: &[f32],
     ) -> Result<(Vec<f32>, usize, usize)> {
         let c_out = w_w.rows;
+        assert_eq!(x.len(), b * c_in * h * w, "conv_block input size mismatch");
         let (cols, h_out, w_out) = im2col_3x3_s2p1(x, b, c_in, h, w);
-        let col_count = b * c_in * h_out * w_out;
-        let k = 9 * c_in;
+        let col_count = b * h_out * w_out;
+        let k = c_in * 9;
+        assert_eq!(w_w.cols, k, "conv_block weight cols={} != c_in*9={}", w_w.cols, k);
+        // GEMM: out[c_out, col_count] = weight[c_out, k] @ cols^T[k, col_count]
+        // B = cols^T: rhs strides must be (cs=k, rs=1) — same convention as cpu_engine::gemm_row_major.
         let mut out = vec![0.0f32; c_out * col_count];
         unsafe {
             gemm(
@@ -269,34 +282,29 @@ impl CpuConvStem {
                 out.as_mut_ptr(), 1, col_count as isize,
                 false,
                 w_w.data.as_ptr(), 1, k as isize,
-                cols.as_ptr(), 1, k as isize,
+                cols.as_ptr(), k as isize, 1,
                 0.0, 1.0, false, false, false,
                 Parallelism::Rayon(0),
             );
         }
-
-        // Add bias and GELU. out is [c_out, col_count] (one per-channel conv output per col,
-        // since im2col only fills the ic_in slot matching the col's channel — no implicit sum
-        // over input channels). We must sum over ic_in to get the full conv2d output, then add
-        // bias once per (ib, oc, ho, wo).
+        // out is [c_out, col_count]. Reshape to [b, c_out, h_out, w_out] + bias + GELU fused.
+        // Layout: innermost dim is w_out, so can't par_chunks by c_out. Keep sequential.
         let mut out4d = vec![0.0f32; b * c_out * h_out * w_out];
         for ib in 0..b {
             for ho in 0..h_out {
                 for wo in 0..w_out {
                     for oc in 0..c_out {
-                        let mut v = w_b[oc];
-                        for ic_in in 0..c_in {
-                            let col = ((ib * c_in + ic_in) * h_out + ho) * w_out + wo;
-                            v += out[oc * col_count + col];
-                        }
-                        out4d[((ib * c_out + oc) * h_out + ho) * w_out + wo] = v;
+                        let col = (ib * h_out + ho) * w_out + wo;
+                        let v = out[oc * col_count + col] + w_b[oc];
+                        // GELU inline (tanh approx)
+                        let inner = 0.7978845608_f32 * (v + 0.044715_f32 * v * v * v);
+                        out4d[((ib * c_out + oc) * h_out + ho) * w_out + wo] =
+                            0.5 * v * (1.0 + inner.tanh());
                     }
                 }
             }
         }
-        let mut out_t = CpuTensor::new(out4d, vec![b, c_out, h_out, w_out]);
-        gelu_inplace(&mut out_t);
-        Ok((out_t.data, h_out, w_out))
+        Ok((out4d, h_out, w_out))
     }
 }
 
@@ -364,105 +372,99 @@ impl CpuAudioAttention {
             let mut out = vec![0.0f32; b * nh * s * hd];
             for st in (0..s).step_by(w) {
                 let len = w.min(s - st);
-                let q_chunk = slice_dim1(&q, st, len);
-                let k_chunk = slice_dim1(&k, st, len);
-                let v_chunk = slice_dim1(&v, st, len);
-                let o = attention_window(&q_chunk, &k_chunk, &v_chunk, b, nh, len, hd, scale);
-                scatter_dim2(&mut out, &o, b, nh, s, hd, st, len);
+                let o = attention_window(&q.data, &k.data, &v.data, b, nh, s, dm, hd, len, st, scale);
+                // Scatter: out[(ib, ih, st:st+len, hd)] = o[(ib, ih, 0:len, hd)]
+                out.par_chunks_mut(s * hd)
+                    .zip(o.par_chunks(len * hd))
+                    .for_each(|(dst, src)| {
+                        let dst_off = st * hd;
+                        dst[dst_off..dst_off + len * hd].copy_from_slice(src);
+                    });
             }
             out
         } else {
-            // Full attention (rare in this model — fallback).
-            attention_window(&q, &k, &v, b, nh, s, hd, scale)
+            // Full attention.
+            attention_window(&q.data, &k.data, &v.data, b, nh, s, dm, hd, s, 0, scale)
         };
 
-        // Reshape [b, nh, s, hd] → [b, s, nh, hd] (swap dims 1 and 2) → [b, s, nh*hd].
-        let mut flat = vec![0.0f32; b * s * nh * hd];
-        for ib in 0..b {
-            for ih in 0..nh {
-                for is_ in 0..s {
-                    for jd in 0..hd {
-                        let src = ((ib * nh + ih) * s + is_) * hd + jd;
-                        let dst = ((ib * s + is_) * nh + ih) * hd + jd;
-                        flat[dst] = attn_out[src];
+        // Reshape [b, nh, s, hd] → [b, s, nh*hd] (swap dims 1 and 2).
+        let flat = {
+            let mut out = vec![0.0f32; b * s * nh * hd];
+            out.par_chunks_mut(nh * hd)
+                .enumerate()
+                .for_each(|(idx, chunk)| {
+                    let ib = idx / s;
+                    let is_ = idx % s;
+                    for ih in 0..nh {
+                        let src_off = ((ib * nh + ih) * s + is_) * hd;
+                        let dst_off = ih * hd;
+                        chunk[dst_off..dst_off + hd].copy_from_slice(&attn_out[src_off..src_off + hd]);
                     }
-                }
-            }
-        }
+                });
+            out
+        };
         let attn_flat = CpuTensor::new(flat, vec![b, s, nh * hd]);
         self.out_proj.forward(&attn_flat)
     }
 }
 
-/// x: [b, s, dm] → out_chunk: [b, len, dm] for s in [st, st+len).
-fn slice_dim1(x: &CpuTensor, st: usize, len: usize) -> CpuTensor {
-    let b = x.shape[0];
-    let dm = x.shape[2];
-    let mut data = vec![0.0f32; b * len * dm];
-    for ib in 0..b {
-        for i in 0..len {
-            for j in 0..dm {
-                data[(ib * len + i) * dm + j] = x.data[((ib * x.shape[1] + st + i) * dm + j)];
-            }
-        }
-    }
-    CpuTensor::new(data, vec![b, len, dm])
-}
-
-/// Scatter `src [b, nh, len, hd]` into `dst [b, nh, s, hd]` at `dst[..., st:st+len, ...]`.
-fn scatter_dim2(dst: &mut [f32], src: &[f32], b: usize, nh: usize, s: usize, hd: usize, st: usize, len: usize) {
-    for ib in 0..b {
-        for ih in 0..nh {
-            for i in 0..len {
-                for jd in 0..hd {
-                    let sidx = ((ib * nh + ih) * len + i) * hd + jd;
-                    let didx = ((ib * nh + ih) * s + (st + i)) * hd + jd;
-                    dst[didx] = src[sidx];
-                }
-            }
-        }
-    }
-}
-
-/// q,k,v: [b, s, dm] (treated as [b, s, nh*hd]). Returns [b, nh, s, hd].
-/// Single-call attention (windowed uses this with s = chunk_len).
+/// Scalar attention with rayon parallelism across (batch, head) pairs.
+/// q/k/v: [b, s, dm] flat. Processes positions [st, st+len).
+/// Returns [b*nh, len*hd] where each chunk is one (batch, head) pair's output for the window.
 fn attention_window(
-    q: &CpuTensor, k: &CpuTensor, v: &CpuTensor,
-    b: usize, nh: usize, s: usize, hd: usize, scale: f32,
+    q: &[f32], k: &[f32], v: &[f32],
+    b: usize, nh: usize, s: usize, dm: usize, hd: usize, len: usize, st: usize, scale: f32,
 ) -> Vec<f32> {
-    let mut out = vec![0.0f32; b * nh * s * hd];
-    for ib in 0..b {
-        for ih in 0..nh {
-            for is_ in 0..s {
-                let mut scores = vec![0.0f32; s];
+    let bn = b * nh;
+    let chunk_len = len * hd;
+    let mut out = vec![0.0f32; bn * chunk_len];
+    out.par_chunks_mut(chunk_len)
+        .enumerate()
+        .for_each(|(idx, out_chunk)| {
+            let ib = idx / nh;
+            let ih = idx % nh;
+            let head_off = ih * hd;
+            // Process each query position in [st, st+len).
+            for qi in 0..len {
+                let q_pos = st + qi;
+                let q_base = (ib * s + q_pos) * dm + head_off;
+                // Compute scores for all key positions in [st, st+len).
+                let mut scores = vec![0.0f32; len];
                 let mut max_s = f32::NEG_INFINITY;
-                for it in 0..s {
+                for ki in 0..len {
+                    let k_pos = st + ki;
+                    let k_base = (ib * s + k_pos) * dm + head_off;
                     let mut dot = 0.0f32;
                     for jd in 0..hd {
-                        let qv = q.data[((ib * s + is_) * nh * hd + ih * hd) + jd];
-                        let kv = k.data[((ib * s + it) * nh * hd + ih * hd) + jd];
-                        dot += qv * kv;
+                        unsafe {
+                            dot += *q.get_unchecked(q_base + jd) * *k.get_unchecked(k_base + jd);
+                        }
                     }
                     let s_ = dot * scale;
-                    scores[it] = s_;
+                    scores[ki] = s_;
                     if s_ > max_s { max_s = s_; }
                 }
+                // Softmax.
                 let mut sum = 0.0f32;
-                for t in 0..s {
-                    scores[t] = (scores[t] - max_s).exp();
-                    sum += scores[t];
+                for sc in scores.iter_mut() {
+                    *sc = (*sc - max_s).exp();
+                    sum += *sc;
                 }
                 let inv = 1.0 / sum;
-                for it in 0..s {
-                    let w = scores[it] * inv;
+                // Weighted sum of V.
+                let out_base = qi * hd;
+                for ki in 0..len {
+                    let w = scores[ki] * inv;
+                    let k_pos = st + ki;
+                    let v_base = (ib * s + k_pos) * dm + head_off;
                     for jd in 0..hd {
-                        let vv = v.data[((ib * s + it) * nh * hd + ih * hd) + jd];
-                        out[((ib * nh + ih) * s + is_) * hd + jd] += w * vv;
+                        unsafe {
+                            *out_chunk.get_unchecked_mut(out_base + jd) += w * *v.get_unchecked(v_base + jd);
+                        }
                     }
                 }
             }
-        }
-    }
+        });
     out
 }
 
@@ -510,15 +512,17 @@ impl CpuAudioLayer {
 
     /// x: [b, s, d_model] consumed; returns post-residual h of same shape.
     pub(crate) fn forward(&self, x: CpuTensor, ws: Option<usize>) -> Result<CpuTensor> {
+        let shape = x.shape.clone();
         let normed = self.sln.forward(&x);
         let attn_out = self.attn.forward(&normed, ws)?;
-        let mut x1_data = x.data.clone();
-        for (a, b) in x1_data.iter_mut().zip(attn_out.data.iter()) { *a += *b; }
-        let x1 = CpuTensor::new(x1_data, x.shape.clone());
+        // Residual add in-place on x.data (no clone needed — x is consumed).
+        let mut x_data = x.data;
+        x_data.par_iter_mut().zip(&attn_out.data).for_each(|(a, b)| *a += *b);
+        let x1 = CpuTensor::new(x_data, shape);
         let normed2 = self.fln.forward(&x1);
         let ffn_out = self.ffn.forward(&normed2)?;
         let mut x2_data = x1.data;
-        for (a, b) in x2_data.iter_mut().zip(ffn_out.data.iter()) { *a += *b; }
+        x2_data.par_iter_mut().zip(&ffn_out.data).for_each(|(a, b)| *a += *b);
         Ok(CpuTensor::new(x2_data, x1.shape))
     }
 }
@@ -557,20 +561,64 @@ impl CpuAudioEncoder {
         Ok(Self { conv_stem, layers, ln_post, proj1, proj2, config: config.clone() })
     }
 
-    /// mel: [n_mels * T_mel] flat. Returns [n_total, output_dim] flat.
+    /// mel: [n_mels * mel_len] flat (mel-bin-major, frame-minor). Returns [n_total, output_dim] flat.
     pub(crate) fn forward(&self, mel: &[f32], n_mels: usize, mel_len: usize) -> Result<Vec<f32>> {
-        let (conv_data, n_total) = self.conv_stem.forward(mel, n_mels, mel_len)?;
-        let dm = self.config.d_model;
+        let cs = self.config.n_window * 2;
+        let tpc = feo(cs);
+        let nfull = mel_len / cs;
+        let tail = mel_len % cs;
+        let n_chunks = nfull + if tail > 0 { 1 } else { 0 };
 
+        // Build chunked mel buffer [n_chunks * n_mels * cs], zero-padded.
+        let mut chunked = vec![0.0f32; n_chunks * n_mels * cs];
+        let mut chunk_tokens: Vec<usize> = Vec::with_capacity(n_chunks);
+        for i in 0..nfull {
+            let s = i * cs;
+            for m in 0..n_mels {
+                let dst_base = (i * n_mels + m) * cs;
+                let src_base = m * mel_len + s;
+                for j in 0..cs {
+                    chunked[dst_base + j] = mel[src_base + j];
+                }
+            }
+            chunk_tokens.push(tpc);
+        }
+        if tail > 0 {
+            let s = nfull * cs;
+            for m in 0..n_mels {
+                let dst_base = (nfull * n_mels + m) * cs;
+                let src_base = m * mel_len + s;
+                for j in 0..tail {
+                    chunked[dst_base + j] = mel[src_base + j];
+                }
+                // Rest is already zero-padded.
+            }
+            chunk_tokens.push(feo(tail));
+        }
+
+        // Conv stem on batched chunks.
+        let (conv_data, t2) = self.conv_stem.forward(&chunked, n_chunks, n_mels, cs)?;
+        let dm = self.config.d_model;
+        let n_total: usize = chunk_tokens.iter().sum();
+
+        // Pack valid tokens from each chunk into [1, n_total, d_model].
+        let mut packed = Vec::with_capacity(n_total * dm);
+        for (idx, &v) in chunk_tokens.iter().enumerate() {
+            let base = idx * t2 * dm;
+            packed.extend_from_slice(&conv_data[base..base + v * dm]);
+        }
+
+        // Transformer layers.
         let cs2 = self.config.n_window * 2;
-        let tpc = feo(cs2);
+        let tpc2 = feo(cs2);
         let cpw = self.config.n_window_infer / cs2;
-        let ws = tpc * cpw;
-        let mut h = CpuTensor::new(conv_data, vec![1, n_total, dm]);
+        let ws = tpc2 * cpw;
+        let mut h = CpuTensor::new(packed, vec![1, n_total, dm]);
         for layer in &self.layers {
             h = layer.forward(h, Some(ws))?;
         }
 
+        // Final projections.
         let h = self.ln_post.forward(&h);
         let mut h = self.proj1.forward(&h)?;
         gelu_inplace(&mut h);

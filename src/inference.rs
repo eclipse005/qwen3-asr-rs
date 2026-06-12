@@ -12,6 +12,8 @@ use crate::raw_tensor::RawTensor;
 
 #[cfg(feature = "cpu")]
 use crate::cpu_engine::CpuTextDecoder;
+#[cfg(feature = "cpu")]
+use crate::cpu_audio_encoder::CpuAudioEncoder;
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 #[cfg(feature = "cuda")]
@@ -63,6 +65,8 @@ pub(crate) struct AsrInferenceInner {
     pub(crate) gpu_audio_encoder: Option<GpuAudioEncoder>,
     #[cfg(feature = "cpu")]
     pub(crate) cpu_decoder: Option<CpuTextDecoder>,
+    #[cfg(feature = "cpu")]
+    pub(crate) cpu_audio_encoder: Option<CpuAudioEncoder>,
     pub(crate) mel_extractor: MelExtractor,
     pub(crate) tokenizer: tokenizers::Tokenizer,
     pub(crate) config: AsrConfig,
@@ -128,6 +132,8 @@ impl AsrInference {
                     gpu_audio_encoder: Some(gpu_audio_encoder),
                     #[cfg(feature = "cpu")]
                     cpu_decoder: None,
+                    #[cfg(feature = "cpu")]
+                    cpu_audio_encoder: None,
                     mel_extractor, tokenizer, config,
                     backend: Backend::Cuda(cuda),
                 };
@@ -139,12 +145,16 @@ impl AsrInference {
                     info!("Loading text decoder (CPU gemm+rayon engine)...");
                     let cpu_decoder = CpuTextDecoder::load(&weights, "thinker.model", &config.thinker_config.text_config)
                         .context("load CPU text decoder")?;
+                    info!("Loading audio encoder (CPU f32 engine)...");
+                    let cpu_audio_encoder = CpuAudioEncoder::load(&weights, "thinker.audio_tower", &config.thinker_config.audio_config)
+                        .context("load CPU audio encoder")?;
                     let inner = AsrInferenceInner {
                         #[cfg(feature = "cuda")]
                         gpu_decoder: None,
                         #[cfg(feature = "cuda")]
                         gpu_audio_encoder: None,
                         cpu_decoder: Some(cpu_decoder),
+                        cpu_audio_encoder: Some(cpu_audio_encoder),
                         mel_extractor, tokenizer, config,
                         backend: Backend::Cpu,
                     };
@@ -241,13 +251,15 @@ impl AsrInferenceInner {
 
     #[cfg(feature = "cpu")]
     fn encode_audio_cpu(&self, samples: &[f32]) -> anyhow::Result<Vec<f32>> {
-        // CPU audio encoder is not yet implemented.  For v1, fail loudly so users don't
-        // silently get wrong transcripts.
-        let _ = samples;
-        Err(anyhow::anyhow!(
-            "CPU audio encoder not yet implemented (only CUDA audio path is shipping in v1); \
-             re-run with the `cuda` feature for end-to-end transcribe"
-        ))
+        let (mel_data, n_mels, n_frames) = self.mel_extractor.extract(samples)?;
+        debug!("Mel: {}×{} frames", n_mels, n_frames);
+        let encoder = self.cpu_audio_encoder.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("CPU audio encoder not loaded"))?;
+        let out = encoder.forward(&mel_data, n_mels, n_frames)?;
+        let output_dim = self.config.thinker_config.audio_config.output_dim;
+        let n_tokens = out.len() / output_dim;
+        info!("Audio tokens: {}", n_tokens);
+        Ok(out)
     }
 
     /// Run the text decoder.  `audio_embeds` is a host f32 vector of shape [n_tokens, hidden].
