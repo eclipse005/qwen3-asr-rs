@@ -1,8 +1,9 @@
-//! CPU audio encoder for Qwen3-ASR — f32 throughout.
+//! CPU audio encoder for Qwen3-ASR — f32 compute, f16 weight storage.
 //!
 //! Mirrors `src/gpu_audio_encoder.rs` 1:1 but uses `gemm` + hand-written f32
-//! loops (no cudarc, no half SIMD, no f16 internal storage). Weights are
-//! upcast from f16 safetensors to `Vec<f32>` at load time.
+//! loops (no cudarc, no half SIMD). Weights are stored as f16 and converted
+//! to f32 on-the-fly before GEMM — halves memory vs f32 storage with minimal
+//! overhead (~2-3% of prefill time).
 //!
 //! Architecture:
 //!   mel [T_mel, 128]  →  conv2d stem (3 × {im2col + gemm + bias + GELU})
@@ -22,10 +23,29 @@ use crate::config::AudioEncoderConfig;
 use crate::cpu_engine::{linear, CpuTensor, CpuWeight};
 use crate::raw_tensor::RawTensor;
 
+// ─── f16 weight storage ────────────────────────────────────────────
+
+/// Weight matrix stored as f16 — halved memory vs f32.
+/// Converted to f32 on-the-fly before GEMM via `to_f32()`.
+pub(crate) struct CpuWeightF16 {
+    pub data: Vec<half::f16>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl CpuWeightF16 {
+    /// Convert f16 → f32 sequentially. Called once per GEMM invocation.
+    /// Sequential avoids rayon task spawn overhead for ~100 calls/forward.
+    fn to_f32(&self) -> CpuWeight {
+        let data: Vec<f32> = self.data.iter().map(|v| v.to_f32()).collect();
+        CpuWeight { data, rows: self.rows, cols: self.cols }
+    }
+}
+
 // ─── Linear + LayerNorm primitives ─────────────────────────────────
 
 pub(crate) struct CpuAudioLinear {
-    pub w: CpuWeight,
+    pub w: CpuWeightF16,
     pub bias: Option<Vec<f32>>,
 }
 
@@ -37,7 +57,7 @@ impl CpuAudioLinear {
         let (data, shape) = weights
             .get(&format!("{}.weight", prefix))
             .ok_or_else(|| anyhow::anyhow!("weight not found: {}.weight", prefix))?
-            .as_f32()?;
+            .as_f16()?;
         let rows = shape[0];
         let cols = shape[1];
         let bias = if weights.contains_key(&format!("{}.bias", prefix)) {
@@ -49,12 +69,13 @@ impl CpuAudioLinear {
         } else {
             None
         };
-        Ok(Self { w: CpuWeight { data, rows, cols }, bias })
+        Ok(Self { w: CpuWeightF16 { data, rows, cols }, bias })
     }
 
     /// x: [..., in_features] → [..., out_features]  (bias added if present)
     pub(crate) fn forward(&self, x: &CpuTensor) -> Result<CpuTensor> {
-        let mut y = linear(x, &self.w);
+        let w_f32 = self.w.to_f32();
+        let mut y = linear(x, &w_f32);
         if let Some(b) = &self.bias {
             let last = y.shape.last().unwrap();
             y.data.par_chunks_mut(*last).for_each(|row| {
@@ -159,9 +180,9 @@ pub(crate) fn im2col_3x3_s2p1(x: &[f32], b: usize, c_in: usize, h: usize, w: usi
 }
 
 pub(crate) struct CpuConvStem {
-    c1_w: CpuWeight, c1_b: Vec<f32>,
-    c2_w: CpuWeight, c2_b: Vec<f32>,
-    c3_w: CpuWeight, c3_b: Vec<f32>,
+    c1_w: CpuWeightF16, c1_b: Vec<f32>,
+    c2_w: CpuWeightF16, c2_b: Vec<f32>,
+    c3_w: CpuWeightF16, c3_b: Vec<f32>,
     co: CpuAudioLinear,
     pe: Vec<f32>,        // [max_pos, d_model] f32
     d_model: usize,
@@ -265,7 +286,7 @@ impl CpuConvStem {
         &self,
         x: &[f32],
         b: usize, c_in: usize, h: usize, w: usize,
-        w_w: &CpuWeight, w_b: &[f32],
+        w_w: &CpuWeightF16, w_b: &[f32],
     ) -> Result<(Vec<f32>, usize, usize)> {
         let c_out = w_w.rows;
         assert_eq!(x.len(), b * c_in * h * w, "conv_block input size mismatch");
@@ -273,15 +294,16 @@ impl CpuConvStem {
         let col_count = b * h_out * w_out;
         let k = c_in * 9;
         assert_eq!(w_w.cols, k, "conv_block weight cols={} != c_in*9={}", w_w.cols, k);
+        // Convert f16 → f32 for GEMM.
+        let w_f32 = w_w.to_f32();
         // GEMM: out[c_out, col_count] = weight[c_out, k] @ cols^T[k, col_count]
-        // B = cols^T: rhs strides must be (cs=k, rs=1) — same convention as cpu_engine::gemm_row_major.
         let mut out = vec![0.0f32; c_out * col_count];
         unsafe {
             gemm(
                 c_out, col_count, k,
                 out.as_mut_ptr(), 1, col_count as isize,
                 false,
-                w_w.data.as_ptr(), 1, k as isize,
+                w_f32.data.as_ptr(), 1, k as isize,
                 cols.as_ptr(), k as isize, 1,
                 0.0, 1.0, false, false, false,
                 Parallelism::Rayon(0),
@@ -308,11 +330,11 @@ impl CpuConvStem {
     }
 }
 
-fn load_conv_weight(weights: &HashMap<String, RawTensor>, name: &str) -> Result<CpuWeight> {
-    let (data, shape) = weights.get(name).ok_or_else(|| anyhow::anyhow!("weight not found: {}", name))?.as_f32()?;
+fn load_conv_weight(weights: &HashMap<String, RawTensor>, name: &str) -> Result<CpuWeightF16> {
+    let (data, shape) = weights.get(name).ok_or_else(|| anyhow::anyhow!("weight not found: {}", name))?.as_f16()?;
     let c_out = shape[0];
     let k = shape[1..].iter().product::<usize>();
-    Ok(CpuWeight { data, rows: c_out, cols: k })
+    Ok(CpuWeightF16 { data, rows: c_out, cols: k })
 }
 
 fn load_bias(weights: &HashMap<String, RawTensor>, name: &str) -> Result<Vec<f32>> {
