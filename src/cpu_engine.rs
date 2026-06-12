@@ -16,7 +16,7 @@
 //! This module is `#[cfg(feature = "cpu")]` only — the CUDA path is untouched.
 
 use anyhow::Result;
-use burn::tensor::TensorData;
+use crate::raw_tensor::RawTensor;
 use gemm::{gemm, Parallelism};
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -441,7 +441,7 @@ pub(crate) struct CpuDecoderLayer {
 
 impl CpuDecoderLayer {
     pub fn load(
-        weights: &HashMap<String, TensorData>,
+        weights: &HashMap<String, RawTensor>,
         prefix: &str,
         cfg: &TextDecoderConfig,
     ) -> Result<Self> {
@@ -664,7 +664,7 @@ pub(crate) struct CpuTextDecoder {
 }
 
 impl CpuTextDecoder {
-    pub fn load(weights: &HashMap<String, TensorData>, prefix: &str, config: &TextDecoderConfig) -> Result<Self> {
+    pub fn load(weights: &HashMap<String, RawTensor>, prefix: &str, config: &TextDecoderConfig) -> Result<Self> {
         let embed_table = load_weight(weights, &format!("{}.embed_tokens.weight", prefix))?;
         let norm_w = load_vec_f32(weights, &format!("{}.norm.weight", prefix))?;
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
@@ -784,32 +784,25 @@ fn build_interleaved_dim_map(s: &[usize], t: usize) -> Vec<usize> {
 //  Weight loading helpers
 // ═══════════════════════════════════════════════════════════════════════
 
-fn load_f32_vec(weights: &HashMap<String, TensorData>, name: &str) -> Result<(Vec<f32>, Vec<usize>)> {
+fn load_f32_vec(weights: &HashMap<String, RawTensor>, name: &str) -> Result<(Vec<f32>, Vec<usize>)> {
     let td = weights.get(name).ok_or_else(|| anyhow::anyhow!("weight not found: {}", name))?;
-    let shape = td.shape.to_vec();
-    let data: Vec<f32> = match td.dtype {
-        burn::tensor::DType::F32 => td.to_vec::<f32>().map_err(|e| anyhow::anyhow!("dtype mismatch for {}: {:?}", name, e))?,
-        burn::tensor::DType::F16 => td.to_vec::<half::f16>()
-            .map_err(|e| anyhow::anyhow!("dtype mismatch for {}: {:?}", name, e))?
-            .into_iter().map(|v| v.to_f32()).collect(),
-        _ => anyhow::bail!("unsupported dtype {:?} for {}", td.dtype, name),
-    };
+    let (data, shape) = td.as_f32()?;
     Ok((data, shape))
 }
 
-fn load_vec_f32(weights: &HashMap<String, TensorData>, name: &str) -> Result<Vec<f32>> {
+fn load_vec_f32(weights: &HashMap<String, RawTensor>, name: &str) -> Result<Vec<f32>> {
     let (data, _) = load_f32_vec(weights, name)?;
     Ok(data)
 }
 
-fn load_weight(weights: &HashMap<String, TensorData>, name: &str) -> Result<CpuWeight> {
+fn load_weight(weights: &HashMap<String, RawTensor>, name: &str) -> Result<CpuWeight> {
     let (data, shape) = load_f32_vec(weights, name)?;
     assert_eq!(shape.len(), 2, "weight {} should be 2D", name);
     Ok(CpuWeight { data, rows: shape[0], cols: shape[1] })
 }
 
 /// Load Q+K+V projections and concatenate into a single [q_dim + 2*kv_dim, hidden] matrix.
-fn load_fused_qkv(weights: &HashMap<String, TensorData>, prefix: &str) -> Result<CpuWeight> {
+fn load_fused_qkv(weights: &HashMap<String, RawTensor>, prefix: &str) -> Result<CpuWeight> {
     let (qw, qs) = load_f32_vec(weights, &format!("{}.q_proj.weight", prefix))?;
     let (kw, ks) = load_f32_vec(weights, &format!("{}.k_proj.weight", prefix))?;
     let (vw, vs) = load_f32_vec(weights, &format!("{}.v_proj.weight", prefix))?;
@@ -823,7 +816,7 @@ fn load_fused_qkv(weights: &HashMap<String, TensorData>, prefix: &str) -> Result
 }
 
 /// Load gate_proj and up_proj, concatenate into [2*inter, hidden] matrix.
-fn load_fused_gate_up(weights: &HashMap<String, TensorData>, prefix: &str) -> Result<CpuWeight> {
+fn load_fused_gate_up(weights: &HashMap<String, RawTensor>, prefix: &str) -> Result<CpuWeight> {
     let (gw, gs) = load_f32_vec(weights, &format!("{}.gate_proj.weight", prefix))?;
     let (uw, us) = load_f32_vec(weights, &format!("{}.up_proj.weight", prefix))?;
     let inter = gs[0]; let hidden = gs[1];

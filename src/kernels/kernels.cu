@@ -11,7 +11,8 @@
 // ─── RMS norm: x [outer, last] * weight[last] → out, with f32 accumulation ──
 // One block per row; block_size threads cooperate over `last`.
 // Shared mem: block_size * sizeof(float).
-extern "C" __global__ void rms_norm_f16(
+extern "C" __global__ void __launch_bounds__(1024, 2)
+rms_norm_f16(
     __half* __restrict__ out,
     const __half* __restrict__ x,
     const __half* __restrict__ w,
@@ -49,7 +50,8 @@ extern "C" __global__ void rms_norm_f16(
 // ─── Fused: residual_inplace = residual + add_in; out = rms_norm(residual_inplace, w) ──
 // Writes `residual_inplace` with the residual sum AND `out` with the normed result.
 // Shared mem: bs * sizeof(float).
-extern "C" __global__ void add_residual_rms_norm_f16(
+extern "C" __global__ void __launch_bounds__(1024, 2)
+add_residual_rms_norm_f16(
     __half* __restrict__ residual_inplace,   // r' = r + a
     __half* __restrict__ out,                // out = rms_norm(r', w)
     const __half* __restrict__ add_in,
@@ -90,7 +92,8 @@ extern "C" __global__ void add_residual_rms_norm_f16(
 }
 
 // ─── Element-wise add: out = a + b ─────────────────────────────────
-extern "C" __global__ void add_f16(
+extern "C" __global__ void __launch_bounds__(1024, 2)
+add_f16(
     __half* __restrict__ out,
     const __half* __restrict__ a,
     const __half* __restrict__ b,
@@ -102,7 +105,8 @@ extern "C" __global__ void add_f16(
 }
 
 // ─── In-place add: a += b ──────────────────────────────────────────
-extern "C" __global__ void add_inplace_f16(
+extern "C" __global__ void __launch_bounds__(1024, 2)
+add_inplace_f16(
     __half* __restrict__ a,
     const __half* __restrict__ b,
     int n
@@ -113,7 +117,8 @@ extern "C" __global__ void add_inplace_f16(
 }
 
 // ─── SiLU(gate) * up (SwiGLU activation) ───────────────────────────
-extern "C" __global__ void silu_mul_f16(
+extern "C" __global__ void __launch_bounds__(1024, 2)
+silu_mul_f16(
     __half* __restrict__ out,
     const __half* __restrict__ gate,
     const __half* __restrict__ up,
@@ -129,7 +134,8 @@ extern "C" __global__ void silu_mul_f16(
 // ─── Fused gate-up split + SiLU(gate)*up ──────────────────────────
 // gu: [outer, 2*inter] in row-major (gate first half of last dim, up second half).
 // Writes activated [outer, inter].
-extern "C" __global__ void silu_mul_split_f16(
+extern "C" __global__ void __launch_bounds__(1024, 2)
+silu_mul_split_f16(
     __half* __restrict__ out,
     const __half* __restrict__ gu,
     int outer,
@@ -149,7 +155,8 @@ extern "C" __global__ void silu_mul_split_f16(
 // ─── Softmax with scale + optional causal mask ─────────────────────
 // x shape (logical [bh, m, n]) launched as grid = (bh * m,). One block per row.
 // is_causal != 0 keeps positions [0..row_in_m+1) only.
-extern "C" __global__ void softmax_scaled_causal_f16(
+extern "C" __global__ void __launch_bounds__(1024, 1)
+softmax_scaled_causal_f16(
     __half* __restrict__ out,
     const __half* __restrict__ x,
     int m,
@@ -207,7 +214,8 @@ extern "C" __global__ void softmax_scaled_causal_f16(
 // ─── Rotary embedding ──────────────────────────────────────────────
 // x [b, h, s, d], cos/sin [total_s, d] (broadcast over b, h, indexed at pos_offset+is).
 // rotate_half: for i<half → -x[i+half], for i>=half → x[i-half].
-extern "C" __global__ void rotary_emb_f16(
+extern "C" __global__ void __launch_bounds__(1024, 2)
+rotary_emb_f16(
     __half* __restrict__ out,
     const __half* __restrict__ x,
     const __half* __restrict__ cos,
@@ -237,7 +245,8 @@ extern "C" __global__ void rotary_emb_f16(
 // Per-row norm over head_dim, then rotary on the same row.
 // x [b, h, s, d], weight [d], cos/sin [total_s, d] indexed at pos_offset+is.
 // Grid = (b*h*s,); one block per (head, seq) row.
-extern "C" __global__ void rms_norm_rotary_f16(
+extern "C" __global__ void __launch_bounds__(128, 8)
+rms_norm_rotary_f16(
     __half* __restrict__ out,
     const __half* __restrict__ x,
     const __half* __restrict__ w,
@@ -286,7 +295,8 @@ extern "C" __global__ void rms_norm_rotary_f16(
 // ─── Repeat KV from sparse cache ───────────────────────────────────
 // cache layout (per-layer): [b, nkvh, max_seq, d]; valid rows [0..cur_len).
 // Output dst [b, nqh, cur_len, d] contiguous (cur_len-major within head).
-extern "C" __global__ void repeat_kv_from_cache_f16(
+extern "C" __global__ void __launch_bounds__(1024, 2)
+repeat_kv_from_cache_f16(
     __half* __restrict__ dst,
     const __half* __restrict__ cache,
     int b, int nkvh, int max_seq, int d,
@@ -308,7 +318,8 @@ extern "C" __global__ void repeat_kv_from_cache_f16(
 }
 
 // ─── Embedding lookup ─────────────────────────────────────────────
-extern "C" __global__ void embed_lookup_f16(
+extern "C" __global__ void __launch_bounds__(256, 4)
+embed_lookup_f16(
     __half* __restrict__ out,
     const __half* __restrict__ table,
     const long long* __restrict__ ids,
@@ -327,7 +338,8 @@ extern "C" __global__ void embed_lookup_f16(
 // ─── Single-token embed lookup, id read from GPU i32 buffer ──────
 // Used by the decode hot loop to chain argmax (writes ids[slot]) → embed (reads ids[slot])
 // without an htod round-trip.
-extern "C" __global__ void embed_lookup_single_i32_f16(
+extern "C" __global__ void __launch_bounds__(1024, 1)
+embed_lookup_single_i32_f16(
     __half* __restrict__ out,
     const __half* __restrict__ table,
     const int* __restrict__ ids,
@@ -355,7 +367,8 @@ extern "C" __global__ void embed_lookup_single_i32_f16(
 // each thread covers a stripe of vocab rows. cur GPU (P104, sm_61) can handle this fine
 // because vocab~151936 / 1024 threads = ~148 dot-products per thread, each 1024 multiplies.
 // Total ~152M ops per token, ~5ms on f16 — acceptable, saves alloc + launch overhead.
-extern "C" __global__ void lm_head_gemv_argmax_f16(
+extern "C" __global__ void __launch_bounds__(1024, 1)
+lm_head_gemv_argmax_f16(
     int* __restrict__ out_idx,
     const __half* __restrict__ hidden,      // [hs]
     const __half* __restrict__ embed_table, // [vocab, hs]   row-major
@@ -393,7 +406,8 @@ extern "C" __global__ void lm_head_gemv_argmax_f16(
 }
 
 // ─── Argmax over a vector of length n (single block) ───────────────
-extern "C" __global__ void argmax_f16(
+extern "C" __global__ void __launch_bounds__(1024, 1)
+argmax_f16(
     int* __restrict__ out_idx,
     const __half* __restrict__ x,
     int n
@@ -427,7 +441,8 @@ extern "C" __global__ void argmax_f16(
 // Same as argmax_f16 but writes into out_idx[slot] instead of out_idx[0].
 // Lets the decode loop reuse a single i32 buffer across all steps and chain
 // the result into embed_lookup_single_i32_f16 without an htod round-trip.
-extern "C" __global__ void argmax_into_slot_f16(
+extern "C" __global__ void __launch_bounds__(1024, 1)
+argmax_into_slot_f16(
     int* __restrict__ out_idx,
     const __half* __restrict__ x,
     int n,
@@ -461,7 +476,8 @@ extern "C" __global__ void argmax_into_slot_f16(
 
 // ─── Swap dims 1 and 2 of a 4-D tensor ─────────────────────────────
 // src [d0, d1, d2, d3] (contig) → dst [d0, d2, d1, d3] (contig)
-extern "C" __global__ void swap_dims_12_f16(
+extern "C" __global__ void __launch_bounds__(1024, 2)
+swap_dims_12_f16(
     __half* __restrict__ dst,
     const __half* __restrict__ src,
     int d0, int d1, int d2, int d3
@@ -480,7 +496,8 @@ extern "C" __global__ void swap_dims_12_f16(
 // ─── Split fused QKV into a single head group ──────────────────────
 // qkv [b, s, total_cols], offset selects start column, h*d contiguous columns.
 // dst [b, h, s, d] (transposed layout from src).
-extern "C" __global__ void qkv_split_f16(
+extern "C" __global__ void __launch_bounds__(1024, 2)
+qkv_split_f16(
     __half* __restrict__ dst,
     const __half* __restrict__ qkv,
     int b, int s, int h, int d, int total_cols, int offset
@@ -501,7 +518,8 @@ extern "C" __global__ void qkv_split_f16(
 // qkv [b, s, total_cols]; Q occupies columns [0..q_dim) with q_dim = nqh*d.
 // Output q_out [b, nqh, s, d]; weight [d]; cos/sin [total_s, d] indexed at pos_offset+is.
 // Grid = (b*nqh*s,) one block per (head, seq) row, threads cooperate over d.
-extern "C" __global__ void qkv_extract_q_norm_rotary_f16(
+extern "C" __global__ void __launch_bounds__(128, 8)
+qkv_extract_q_norm_rotary_f16(
     __half* __restrict__ q_out,
     const __half* __restrict__ qkv,
     const __half* __restrict__ w,
@@ -554,7 +572,8 @@ extern "C" __global__ void qkv_extract_q_norm_rotary_f16(
 //     write Q to q_out, K to k_cache, V to v_cache.  One launch replaces two.
 // Grid: x = b*s,  y = nqh + nkvh  (head slot)
 // Block: d threads cooperate over one row of head_dim.
-extern "C" __global__ void qkv_extract_qkv_norm_rotary_cache_f16(
+extern "C" __global__ void __launch_bounds__(128, 8)
+qkv_extract_qkv_norm_rotary_cache_f16(
     __half* __restrict__ q_out,
     __half* __restrict__ k_cache,
     __half* __restrict__ v_cache,
@@ -639,7 +658,8 @@ extern "C" __global__ void qkv_extract_qkv_norm_rotary_cache_f16(
 // qkv [b, s, total_cols]; K at cols [q_dim..q_dim+kv_dim), V at [q_dim+kv_dim..q_dim+2*kv_dim).
 // Writes k_cache [b, nkvh, max_seq, d] and v_cache [b, nkvh, max_seq, d] at rows [start..start+s).
 // Grid = (b*nkvh*s,) one block per (kv_head, seq) row.
-extern "C" __global__ void qkv_extract_kv_norm_rotary_cache_f16(
+extern "C" __global__ void __launch_bounds__(128, 8)
+qkv_extract_kv_norm_rotary_cache_f16(
     __half* __restrict__ k_cache,
     __half* __restrict__ v_cache,
     const __half* __restrict__ qkv,
@@ -695,7 +715,8 @@ extern "C" __global__ void qkv_extract_kv_norm_rotary_cache_f16(
 
 // ─── KV cache write ───────────────────────────────────────────────
 // k_new [b, nkvh, s_new, d] (contig) → cache [b, nkvh, max_seq, d] at rows [start..start+s_new).
-extern "C" __global__ void kv_cache_write_f16(
+extern "C" __global__ void __launch_bounds__(1024, 2)
+kv_cache_write_f16(
     __half* __restrict__ cache,
     const __half* __restrict__ k_new,
     int b, int nkvh, int max_seq, int d,
@@ -713,7 +734,8 @@ extern "C" __global__ void kv_cache_write_f16(
 }
 
 // ─── Fused KV cache write (K + V in one launch) ───────────────────
-extern "C" __global__ void kv_cache_write_pair_f16(
+extern "C" __global__ void __launch_bounds__(1024, 2)
+kv_cache_write_pair_f16(
     __half* __restrict__ k_cache,
     __half* __restrict__ v_cache,
     const __half* __restrict__ k_new,
@@ -735,7 +757,8 @@ extern "C" __global__ void kv_cache_write_pair_f16(
 
 // ─── Element-wise GELU (audio encoder activation) ─────────────────
 // Exact GELU: x * 0.5 * (1 + erf(x / sqrt(2)))
-extern "C" __global__ void gelu_f16(
+extern "C" __global__ void __launch_bounds__(1024, 2)
+gelu_f16(
     __half* __restrict__ out,
     const __half* __restrict__ x,
     int n
@@ -748,7 +771,8 @@ extern "C" __global__ void gelu_f16(
 }
 
 // ─── In-place GELU ─────────────────────────────────────────────────
-extern "C" __global__ void gelu_inplace_f16(
+extern "C" __global__ void __launch_bounds__(1024, 2)
+gelu_inplace_f16(
     __half* __restrict__ x,
     int n
 ) {
@@ -761,7 +785,8 @@ extern "C" __global__ void gelu_inplace_f16(
 
 // ─── LayerNorm (with bias) ─────────────────────────────────────────
 // x [outer, last] * weight[last] + bias[last]; mean/var per row.
-extern "C" __global__ void layer_norm_f16(
+extern "C" __global__ void __launch_bounds__(1024, 2)
+layer_norm_f16(
     __half* __restrict__ out,
     const __half* __restrict__ x,
     const __half* __restrict__ w,
@@ -805,7 +830,8 @@ extern "C" __global__ void layer_norm_f16(
 
 // ─── Add bias broadcast (for Linear with bias) ─────────────────────
 // x [outer, last] += bias[last]
-extern "C" __global__ void add_bias_inplace_f16(
+extern "C" __global__ void __launch_bounds__(1024, 2)
+add_bias_inplace_f16(
     __half* __restrict__ x,
     const __half* __restrict__ bias,
     int outer, int last
@@ -828,7 +854,8 @@ extern "C" __global__ void add_bias_inplace_f16(
 //
 // Required shared mem: cur_len * sizeof(float) + d * sizeof(float).
 #define MAX_SEQ_FUSED 4096
-extern "C" __global__ void fused_gqa_decode_f16(
+extern "C" __global__ void __launch_bounds__(1024, 1)
+fused_gqa_decode_f16(
     __half* __restrict__ out,           // [b, nqh, 1, d]
     const __half* __restrict__ q,       // [b, nqh, 1, d]
     const __half* __restrict__ k_cache, // [b, nkvh, max_seq, d]
@@ -853,8 +880,11 @@ extern "C" __global__ void fused_gqa_decode_f16(
     // --- Stage 1: scores[t] = (Q · K[t]) * scale ---
     for (int t = tid; t < cur_len; t += bs) {
         float dot = 0.0f;
-        for (int j = 0; j < d; j++) {
-            dot += __half2float(q_row[j]) * __half2float(k_base[t * d + j]);
+        for (int j = 0; j < d; j += 2) {
+            __half2 q2 = *(const __half2*)(q_row + j);
+            __half2 k2 = *(const __half2*)(k_base + t * d + j);
+            dot += __half2float(q2.x) * __half2float(k2.x)
+                 + __half2float(q2.y) * __half2float(k2.y);
         }
         smem[t] = dot * scale;
     }
@@ -924,7 +954,8 @@ extern "C" __global__ void fused_gqa_decode_f16(
 // Phase 2: each block handles one (b, nqh) — reads N chunks of (max, sum, partial_out),
 // merges with online-softmax correction, writes final out.
 
-extern "C" __global__ void fused_gqa_decode_split_p1_f16(
+extern "C" __global__ void
+fused_gqa_decode_split_p1_f16(
     float* __restrict__ part_out,       // [b, nqh, NCHUNKS, d]   (float for accumulation)
     float* __restrict__ part_max,       // [b, nqh, NCHUNKS]
     float* __restrict__ part_sum,       // [b, nqh, NCHUNKS]
@@ -955,16 +986,24 @@ extern "C" __global__ void fused_gqa_decode_split_p1_f16(
     int chunk_len = t_end - t_start;
 
     extern __shared__ float smem[];   // scores[chunk_size]
+    __shared__ __half q_smem[128];    // d=128, Q cached in shared mem (256 bytes)
 
     const __half* q_row  = q       + (ib * nqh  + qh) * d;
     const __half* k_base = k_cache + (ib * nkvh + kh) * max_seq * d + t_start * d;
     const __half* v_base = v_cache + (ib * nkvh + kh) * max_seq * d + t_start * d;
 
-    // Stage 1: scores
+    // Cooperatively load Q into shared memory (256 bytes)
+    for (int j = tid; j < d; j += bs) q_smem[j] = q_row[j];
+    __syncthreads();
+
+    // Stage 1: scores (vectorized with __half2, Q from shared mem)
     for (int t = tid; t < chunk_len; t += bs) {
         float dot = 0.0f;
-        for (int j = 0; j < d; j++) {
-            dot += __half2float(q_row[j]) * __half2float(k_base[t * d + j]);
+        for (int j = 0; j < d; j += 2) {
+            __half2 q2 = *(const __half2*)(q_smem + j);
+            __half2 k2 = *(const __half2*)(k_base + t * d + j);
+            dot += __half2float(q2.x) * __half2float(k2.x)
+                 + __half2float(q2.y) * __half2float(k2.y);
         }
         smem[t] = dot * scale;
     }
@@ -1032,7 +1071,8 @@ extern "C" __global__ void fused_gqa_decode_split_p1_f16(
 
 // Phase 2: merge chunks via online softmax correction.
 // Grid = (b * nqh,), block_dim = d.
-extern "C" __global__ void fused_gqa_decode_split_p2_f16(
+extern "C" __global__ void __launch_bounds__(128, 8)
+fused_gqa_decode_split_p2_f16(
     __half* __restrict__ out,           // [b, nqh, d]
     const float* __restrict__ part_out, // [b, nqh, n_chunks, d]
     const float* __restrict__ part_max, // [b, nqh, n_chunks]
@@ -1075,7 +1115,8 @@ extern "C" __global__ void fused_gqa_decode_split_p2_f16(
 
 // ─── Slice along dim 2 of [b, h, s, d] ─────────────────────────────
 // out [b, h, len, d] = src[..., start:start+len, ...]
-extern "C" __global__ void slice_dim2_f16(
+extern "C" __global__ void __launch_bounds__(1024, 2)
+slice_dim2_f16(
     __half* __restrict__ out,
     const __half* __restrict__ src,
     int b, int h, int s, int d, int start, int len
@@ -1092,7 +1133,8 @@ extern "C" __global__ void slice_dim2_f16(
 }
 
 // ─── Concat along dim 2: write a chunk [b, h, len, d] into dst [b, h, s, d] at offset ──
-extern "C" __global__ void concat_dim2_write_f16(
+extern "C" __global__ void __launch_bounds__(1024, 2)
+concat_dim2_write_f16(
     __half* __restrict__ dst,
     const __half* __restrict__ src,
     int b, int h, int s, int d, int dst_offset, int len
@@ -1113,7 +1155,8 @@ extern "C" __global__ void concat_dim2_write_f16(
 // out    [b * h_out * w_out, c_in * 3 * 3]   row-major
 //   where h_out = (h + 2 - 3) / 2 + 1, w_out similarly
 // One thread per output element across the full unfolded matrix.
-extern "C" __global__ void im2col_3x3_s2p1_f16(
+extern "C" __global__ void __launch_bounds__(1024, 2)
+im2col_3x3_s2p1_f16(
     __half* __restrict__ out,
     const __half* __restrict__ in,
     int b, int c_in, int h, int w, int h_out, int w_out
@@ -1146,7 +1189,8 @@ extern "C" __global__ void im2col_3x3_s2p1_f16(
 // ─── Fused GELU + bias add + reshape from GEMM output to [b, c_out, h_out, w_out] ──
 // gemm_out [b * h_out * w_out, c_out] (row-major, no bias) → conv_out [b, c_out, h_out, w_out]
 // with bias[c_out] added and GELU applied.
-extern "C" __global__ void conv_postprocess_f16(
+extern "C" __global__ void __launch_bounds__(1024, 2)
+conv_postprocess_f16(
     __half* __restrict__ out,
     const __half* __restrict__ gemm_out,
     const __half* __restrict__ bias,

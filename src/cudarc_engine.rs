@@ -18,8 +18,8 @@ use half::f16;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use burn::tensor::TensorData;
 use crate::config::TextDecoderConfig;
+use crate::raw_tensor::RawTensor;
 
 const KERNEL_SRC: &str = include_str!("kernels/kernels.cu");
 
@@ -579,6 +579,12 @@ impl CudaState {
     /// allocating a fresh i32 each call.  Pair with `download_i32(token_buf)` to get the value.
     pub fn argmax_into(&self, x: &GpuTensor, token_buf: &mut CudaSlice<i32>, slot: usize) -> Result<()> {
         let n = x.numel();
+        self.argmax_into_flat(&x.data, n, token_buf, slot)
+    }
+
+    /// Argmax on a flat buffer — no GpuTensor wrapper, no D2D clone.
+    /// CUDA Graph–safe.
+    pub fn argmax_into_flat(&self, x: &CudaSlice<f16>, n: usize, token_buf: &mut CudaSlice<i32>, slot: usize) -> Result<()> {
         let cfg = LaunchConfig {
             grid_dim: (1, 1, 1),
             block_dim: (1024, 1, 1),
@@ -586,7 +592,7 @@ impl CudaState {
         };
         let n_i = n as i32; let slot_i = slot as i32;
         let mut bb = self.stream.launch_builder(&self.k.argmax_into_slot);
-        bb.arg(token_buf); bb.arg(&x.data); bb.arg(&n_i); bb.arg(&slot_i);
+        bb.arg(token_buf); bb.arg(x); bb.arg(&n_i); bb.arg(&slot_i);
         unsafe { bb.launch(cfg) }?;
         Ok(())
     }
@@ -1045,50 +1051,34 @@ impl GpuKvCache {
 // ═══════════════════════════════════════════════════════════════════════
 
 // ═══════════════════════════════════════════════════════════════════════
-//  Weight loading helpers (re-exported for other modules)
+//  Weight loading helpers (pub(crate) so sibling modules can call directly)
 // ═══════════════════════════════════════════════════════════════════════
 
-pub(crate) mod gpu_helpers {
-    use super::*;
-    pub(crate) fn load_gpu_weight(cuda: &CudaState, weights: &HashMap<String, TensorData>, name: &str) -> Result<GpuWeight> {
-        super::load_gpu_weight(cuda, weights, name)
-    }
-    pub(crate) fn load_gpu_vec(cuda: &CudaState, weights: &HashMap<String, TensorData>, name: &str) -> Result<CudaSlice<f16>> {
-        super::load_gpu_vec(cuda, weights, name)
-    }
-}
-
-fn get_weight_f16(weights: &HashMap<String, TensorData>, name: &str) -> Result<(Vec<f16>, Vec<usize>)> {
-    let td = weights.get(name).ok_or_else(|| anyhow::anyhow!("weight not found: {}", name))?;
-    let shape = td.shape.to_vec();
-    let data_f16: Vec<f16> = match td.dtype {
-        burn::tensor::DType::F32 => td.to_vec::<f32>().map_err(|e| anyhow::anyhow!("dtype mismatch for {}: {:?}", name, e))?
-            .into_iter().map(f16::from_f32).collect(),
-        burn::tensor::DType::F16 => td.to_vec::<f16>().map_err(|e| anyhow::anyhow!("dtype mismatch for {}: {:?}", name, e))?,
-        _ => anyhow::bail!("unsupported dtype {:?} for {}", td.dtype, name),
-    };
-    Ok((data_f16, shape))
-}
-
-fn load_gpu_weight(cuda: &CudaState, weights: &HashMap<String, TensorData>, name: &str) -> Result<GpuWeight> {
+pub(crate) fn load_gpu_weight(cuda: &CudaState, weights: &HashMap<String, RawTensor>, name: &str) -> Result<GpuWeight> {
     let (data_f16, shape) = get_weight_f16(weights, name)?;
     assert_eq!(shape.len(), 2, "weight {} should be 2D", name);
     let dev = cuda.upload_f16(&data_f16)?;
     Ok(GpuWeight { data: dev, rows: shape[0], cols: shape[1] })
 }
 
-fn load_gpu_vec(cuda: &CudaState, weights: &HashMap<String, TensorData>, name: &str) -> Result<CudaSlice<f16>> {
+pub(crate) fn load_gpu_vec(cuda: &CudaState, weights: &HashMap<String, RawTensor>, name: &str) -> Result<CudaSlice<f16>> {
     let (data_f16, _shape) = get_weight_f16(weights, name)?;
     cuda.upload_f16(&data_f16)
 }
 
-fn load_cpu_tensor(weights: &HashMap<String, TensorData>, name: &str) -> Result<CpuTensor> {
+fn get_weight_f16(weights: &HashMap<String, RawTensor>, name: &str) -> Result<(Vec<f16>, Vec<usize>)> {
+    let td = weights.get(name).ok_or_else(|| anyhow::anyhow!("weight not found: {}", name))?;
+    let (data_f16, shape) = td.as_f16()?;
+    Ok((data_f16, shape))
+}
+
+fn load_cpu_tensor(weights: &HashMap<String, RawTensor>, name: &str) -> Result<CpuTensor> {
     let (data_f16, shape) = get_weight_f16(weights, name)?;
     Ok(CpuTensor::new(data_f16, shape))
 }
 
 fn load_fused_qkv_weight(
-    weights: &HashMap<String, TensorData>, prefix: &str, cuda: &CudaState,
+    weights: &HashMap<String, RawTensor>, prefix: &str, cuda: &CudaState,
 ) -> Result<(GpuWeight, usize, usize)> {
     let (qw, qs) = get_weight_f16(weights, &format!("{}.q_proj.weight", prefix))?;
     let (kw, ks) = get_weight_f16(weights, &format!("{}.k_proj.weight", prefix))?;
@@ -1103,7 +1093,7 @@ fn load_fused_qkv_weight(
 }
 
 fn load_fused_gate_up_weight(
-    weights: &HashMap<String, TensorData>, prefix: &str, cuda: &CudaState,
+    weights: &HashMap<String, RawTensor>, prefix: &str, cuda: &CudaState,
 ) -> Result<(GpuWeight, usize)> {
     let (gw, gs) = get_weight_f16(weights, &format!("{}.gate_proj.weight", prefix))?;
     let (uw, us) = get_weight_f16(weights, &format!("{}.up_proj.weight", prefix))?;
@@ -1113,6 +1103,251 @@ fn load_fused_gate_up_weight(
     fused.extend_from_slice(&gw); fused.extend_from_slice(&uw);
     let dev = cuda.upload_f16(&fused)?;
     Ok((GpuWeight { data: dev, rows: 2 * intermediate, cols: hidden }, intermediate))
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  DecodeScratch — pre-allocated temp buffers for the decode hot loop
+// ═══════════════════════════════════════════════════════════════════════
+
+pub(crate) struct DecodeScratch {
+    // Per-layer temporaries (reused across layers since they run sequentially)
+    pub norm1: CudaSlice<f16>,           // [hidden_size]
+    pub qkv: CudaSlice<f16>,            // [fused_qkv_dim] = nqh*hd + 2*nkvh*hd = 4096
+    pub q_out: CudaSlice<f16>,          // [nqh * hd] = 2048
+    pub attn_out: CudaSlice<f16>,       // [nqh * hd] = 2048
+    pub norm2: CudaSlice<f16>,          // [hidden_size]
+    pub gate_up: CudaSlice<f16>,        // [2 * intermediate_size] = 6144
+    pub activated: CudaSlice<f16>,      // [intermediate_size] = 3072
+
+    // Split attention partials — pre-sized for max_chunks
+    pub split_part_out: CudaSlice<f32>, // [nqh * max_chunks * hd]
+    pub split_part_max: CudaSlice<f32>, // [nqh * max_chunks]
+    pub split_part_sum: CudaSlice<f32>, // [nqh * max_chunks]
+
+    // Decoder-level temporaries
+    pub embed_out: CudaSlice<f16>,      // [hidden_size]
+    pub final_norm: CudaSlice<f16>,     // [hidden_size]
+    pub logits: CudaSlice<f16>,         // [vocab_size]
+
+    // Static dimensions (cached to avoid re-computing)
+    pub hs: usize,     // hidden_size
+    pub nqh: usize,    // num_attention_heads
+    pub nkvh: usize,   // num_key_value_heads
+    pub hd: usize,     // head_dim
+    pub inter: usize,  // intermediate_size
+    pub vocab: usize,  // vocab_size
+}
+
+impl DecodeScratch {
+    pub fn new(cuda: &CudaState, max_seq: usize, cfg: &TextDecoderConfig) -> Result<Self> {
+        let hs = cfg.hidden_size;
+        let nqh = cfg.num_attention_heads;
+        let nkvh = cfg.num_key_value_heads;
+        let hd = cfg.head_dim;
+        let inter = cfg.intermediate_size;
+        let vocab = cfg.vocab_size;
+
+        let fused_qkv = (nqh + 2 * nkvh) * hd; // Q + K + V concatenated
+        // Use chunk_size=256 for max_chunks upper bound (conservative)
+        let max_chunks = (max_seq + 255) / 256;
+
+        Ok(Self {
+            norm1: cuda.alloc_uninit_f16(hs)?,
+            qkv: cuda.alloc_uninit_f16(fused_qkv)?,
+            q_out: cuda.alloc_uninit_f16(nqh * hd)?,
+            attn_out: cuda.alloc_uninit_f16(nqh * hd)?,
+            norm2: cuda.alloc_uninit_f16(hs)?,
+            gate_up: cuda.alloc_uninit_f16(2 * inter)?,
+            activated: cuda.alloc_uninit_f16(inter)?,
+            split_part_out: cuda.stream.alloc_zeros::<f32>(nqh * max_chunks * hd)?,
+            split_part_max: cuda.stream.alloc_zeros::<f32>(nqh * max_chunks)?,
+            split_part_sum: cuda.stream.alloc_zeros::<f32>(nqh * max_chunks)?,
+            embed_out: cuda.alloc_uninit_f16(hs)?,
+            final_norm: cuda.alloc_uninit_f16(hs)?,
+            logits: cuda.alloc_uninit_f16(vocab)?,
+            hs, nqh, nkvh, hd, inter, vocab,
+        })
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  _into variants — same as originals but write into pre-allocated buffers
+// ═══════════════════════════════════════════════════════════════════════
+
+impl CudaState {
+    /// rms_norm writing into a pre-allocated `out` buffer.  `out` must have `outer * last` f16 elements.
+    pub fn rms_norm_into(&self, x: &GpuTensor, w: &CudaSlice<f16>, eps: f32, out: &mut CudaSlice<f16>) -> Result<()> {
+        let nd = x.shape().len();
+        let last = x.shape()[nd - 1];
+        let outer: usize = x.shape()[..nd - 1].iter().product();
+        self.rms_norm_into_flat(&x.data, last, outer, w, eps, out)
+    }
+
+    /// rms_norm on a flat buffer — no GpuTensor wrapper, no D2D clone.
+    /// CUDA Graph–safe (no cuMemcpyDtD).
+    pub fn rms_norm_into_flat(&self, x: &CudaSlice<f16>, last: usize, outer: usize, w: &CudaSlice<f16>, eps: f32, out: &mut CudaSlice<f16>) -> Result<()> {
+        let bs = block_for_reduction(last);
+        let cfg = LaunchConfig { grid_dim: (outer as u32, 1, 1), block_dim: (bs, 1, 1), shared_mem_bytes: bs * 4 };
+        let last_i = last as i32; let outer_i = outer as i32;
+        let mut b = self.stream.launch_builder(&self.k.rms_norm);
+        b.arg(out); b.arg(x); b.arg(w); b.arg(&last_i); b.arg(&outer_i); b.arg(&eps);
+        unsafe { b.launch(cfg) }?;
+        Ok(())
+    }
+
+    /// linear_gpu writing into a pre-allocated `out` buffer.
+    pub fn linear_gpu_into(&self, x: &GpuTensor, w: &GpuWeight, out: &mut CudaSlice<f16>) -> Result<()> {
+        let nd = x.shape().len();
+        let m: usize = x.shape()[..nd - 1].iter().product();
+        let k = x.shape()[nd - 1];
+        self.linear_gpu_into_flat(&x.data, m, k, w, out)
+    }
+
+    /// linear_gpu on a flat buffer — no GpuTensor wrapper, no D2D clone.
+    /// CUDA Graph–safe (no cuMemcpyDtD).
+    pub fn linear_gpu_into_flat(&self, x: &CudaSlice<f16>, m: usize, k: usize, w: &GpuWeight, out: &mut CudaSlice<f16>) -> Result<()> {
+        let n = w.rows;
+        assert_eq!(k, w.cols);
+        unsafe {
+            self.blas.gemm(
+                GemmConfig {
+                    transa: sys::cublasOperation_t::CUBLAS_OP_T,
+                    transb: sys::cublasOperation_t::CUBLAS_OP_N,
+                    m: n as i32, n: m as i32, k: k as i32,
+                    alpha: f16::from_f32(1.0),
+                    lda: k as i32, ldb: k as i32,
+                    beta: f16::from_f32(0.0), ldc: n as i32,
+                },
+                &w.data, x, out,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// silu_mul_split writing into a pre-allocated `out` buffer.  `out` must have `outer * inter` f16 elements.
+    pub fn silu_mul_split_into(&self, gu: &CudaSlice<f16>, outer: usize, two_inter: usize, out: &mut CudaSlice<f16>) -> Result<()> {
+        let inter = two_inter / 2;
+        let total = outer * inter;
+        let cfg = LaunchConfig::for_num_elems(total as u32);
+        let outer_i = outer as i32; let inter_i = inter as i32;
+        let mut bb = self.stream.launch_builder(&self.k.silu_mul_split);
+        bb.arg(out); bb.arg(gu); bb.arg(&outer_i); bb.arg(&inter_i);
+        unsafe { bb.launch(cfg) }?;
+        Ok(())
+    }
+
+    /// qkv_extract writing Q into pre-allocated `q_out` buffer.
+    pub fn qkv_extract_into(&self,
+        k_cache: &mut CudaSlice<f16>, v_cache: &mut CudaSlice<f16>,
+        qkv: &CudaSlice<f16>, qn_w: &CudaSlice<f16>, kn_w: &CudaSlice<f16>,
+        cos: &CudaSlice<f16>, sin: &CudaSlice<f16>,
+        nqh: usize, nkvh: usize, d: usize, q_dim: usize, kv_dim: usize,
+        max_seq: usize, start: usize, pos_offset: usize, eps: f32,
+        q_out: &mut CudaSlice<f16>,
+    ) -> Result<()> {
+        let b: usize = 1; let sl: usize = 1;
+        let total_cols = q_dim + 2 * kv_dim;
+        let bs = block_for_reduction(d);
+        let cfg = LaunchConfig { grid_dim: ((b * sl) as u32, (nqh + nkvh) as u32, 1), block_dim: (bs, 1, 1), shared_mem_bytes: bs * 4 };
+        let b_i = b as i32; let nqh_i = nqh as i32; let nkvh_i = nkvh as i32;
+        let sl_i = sl as i32; let d_i = d as i32; let tot_i = total_cols as i32;
+        let q_i = q_dim as i32; let kv_i = kv_dim as i32;
+        let max_i = max_seq as i32; let start_i = start as i32; let po = pos_offset as i32;
+        let mut bb = self.stream.launch_builder(&self.k.qkv_extract_qkv_norm_rotary_cache);
+        bb.arg(q_out); bb.arg(k_cache); bb.arg(v_cache); bb.arg(qkv);
+        bb.arg(qn_w); bb.arg(kn_w); bb.arg(cos); bb.arg(sin);
+        bb.arg(&b_i); bb.arg(&nqh_i); bb.arg(&nkvh_i); bb.arg(&sl_i); bb.arg(&d_i); bb.arg(&tot_i);
+        bb.arg(&q_i); bb.arg(&kv_i);
+        bb.arg(&max_i); bb.arg(&start_i); bb.arg(&po); bb.arg(&eps);
+        unsafe { bb.launch(cfg) }?;
+        Ok(())
+    }
+
+    /// fused_gqa_decode writing into a pre-allocated `out` buffer.
+    pub fn fused_gqa_decode_into(&self, q: &CudaSlice<f16>,
+        k_cache: &CudaSlice<f16>, v_cache: &CudaSlice<f16>,
+        nkvh: usize, max_seq: usize, cur_len: usize, scale: f32,
+        out: &mut CudaSlice<f16>,
+    ) -> Result<()> {
+        let bs: u32 = if cur_len > 1024 { 1024 } else if cur_len > 512 { 512 } else { 256 };
+        let t_chunks = (bs as usize / 128).max(1);
+        let smem_bytes = (cur_len + 128 * t_chunks) * 4;
+        let cfg = LaunchConfig { grid_dim: (16, 1, 1), block_dim: (bs, 1, 1), shared_mem_bytes: smem_bytes as u32 };
+        let nkvh_i = nkvh as i32; let max_i = max_seq as i32; let d_i = 128i32; let cur_i = cur_len as i32;
+        let mut bb = self.stream.launch_builder(&self.k.fused_gqa_decode);
+        bb.arg(out); bb.arg(q); bb.arg(k_cache); bb.arg(v_cache);
+        bb.arg(&1i32); bb.arg(&16i32); bb.arg(&nkvh_i); bb.arg(&max_i); bb.arg(&d_i); bb.arg(&cur_i); bb.arg(&scale);
+        unsafe { bb.launch(cfg) }?;
+        Ok(())
+    }
+
+    /// fused_gqa_decode_split writing into pre-allocated partial + output buffers.
+    /// `max_chunks` is the fixed grid y-dimension (upper bound for graph stability).
+    pub fn fused_gqa_decode_split_into(&self, q: &CudaSlice<f16>,
+        k_cache: &CudaSlice<f16>, v_cache: &CudaSlice<f16>,
+        nkvh: usize, max_seq: usize, cur_len: usize, scale: f32, chunk_size: usize, max_chunks: usize,
+        part_out: &mut CudaSlice<f32>, part_max: &mut CudaSlice<f32>, part_sum: &mut CudaSlice<f32>,
+        out: &mut CudaSlice<f16>,
+    ) -> Result<()> {
+        let n_chunks = (cur_len + chunk_size - 1) / chunk_size;
+        let bs: u32 = 256;
+        let t_split = (bs as usize / 128).max(1);
+        let smem_bytes = (chunk_size + 128 * t_split) * 4;
+        {
+            // Grid y-dim uses max_chunks for stable topology; kernel handles excess chunks
+            let cfg = LaunchConfig { grid_dim: (16, max_chunks as u32, 1), block_dim: (bs, 1, 1), shared_mem_bytes: smem_bytes as u32 };
+            let nkvh_i = nkvh as i32; let max_i = max_seq as i32; let d_i = 128i32;
+            let cur_i = cur_len as i32; let cs_i = chunk_size as i32; let nc_i = n_chunks as i32;
+            let mut bb = self.stream.launch_builder(&self.k.fused_gqa_decode_split_p1);
+            bb.arg(&mut *part_out); bb.arg(&mut *part_max); bb.arg(&mut *part_sum);
+            bb.arg(q); bb.arg(k_cache); bb.arg(v_cache);
+            bb.arg(&1i32); bb.arg(&16i32); bb.arg(&nkvh_i); bb.arg(&max_i); bb.arg(&d_i);
+            bb.arg(&cur_i); bb.arg(&cs_i); bb.arg(&nc_i); bb.arg(&scale);
+            unsafe { bb.launch(cfg) }?;
+        }
+        {
+            let cfg = LaunchConfig { grid_dim: (16, 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+            let nc_i = n_chunks as i32;
+            let mut bb = self.stream.launch_builder(&self.k.fused_gqa_decode_split_p2);
+            bb.arg(out); bb.arg(&*part_out); bb.arg(&*part_max); bb.arg(&*part_sum);
+            bb.arg(&1i32); bb.arg(&16i32); bb.arg(&nc_i); bb.arg(&128i32);
+            unsafe { bb.launch(cfg) }?;
+        }
+        Ok(())
+    }
+
+    /// embed_id_from_gpu_slot writing into a pre-allocated `out` buffer.
+    pub fn embed_id_from_gpu_slot_into(&self, table: &GpuWeight, token_buf: &CudaSlice<i32>, slot: usize, out: &mut CudaSlice<f16>) -> Result<()> {
+        let d = table.cols;
+        let bs = (d as u32).min(1024);
+        let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (bs, 1, 1), shared_mem_bytes: 0 };
+        let slot_i = slot as i32; let d_i = d as i32;
+        let mut bb = self.stream.launch_builder(&self.k.embed_lookup_single_i32);
+        bb.arg(out); bb.arg(&table.data); bb.arg(token_buf); bb.arg(&slot_i); bb.arg(&d_i);
+        unsafe { bb.launch(cfg) }?;
+        Ok(())
+    }
+
+    /// linear_gpu_accum on raw CudaSlice (for decode scratch path).
+    /// y = y + x @ W^T.  x has shape [1, 1, k], W is [n, k], y is [n].
+    pub fn linear_gpu_accum_slice(&self, y: &mut CudaSlice<f16>, x: &CudaSlice<f16>, w: &GpuWeight) -> Result<()> {
+        let k = w.cols;
+        let n = w.rows;
+        unsafe {
+            self.blas.gemm(
+                GemmConfig {
+                    transa: sys::cublasOperation_t::CUBLAS_OP_T,
+                    transb: sys::cublasOperation_t::CUBLAS_OP_N,
+                    m: n as i32, n: 1, k: k as i32,
+                    alpha: f16::from_f32(1.0),
+                    lda: k as i32, ldb: k as i32,
+                    beta: f16::from_f32(1.0), ldc: n as i32,
+                },
+                &w.data, x, y,
+            )?;
+        }
+        Ok(())
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1132,7 +1367,7 @@ struct GpuDecoderLayer {
 }
 
 impl GpuDecoderLayer {
-    fn load(w: &HashMap<String, TensorData>, p: &str, cfg: &TextDecoderConfig, cuda: &CudaState) -> Result<Self> {
+    fn load(w: &HashMap<String, RawTensor>, p: &str, cfg: &TextDecoderConfig, cuda: &CudaState) -> Result<Self> {
         Ok(Self {
             iln_w: load_gpu_vec(cuda, w, &format!("{}.input_layernorm.weight", p))?,
             pln_w: load_gpu_vec(cuda, w, &format!("{}.post_attention_layernorm.weight", p))?,
@@ -1236,6 +1471,61 @@ impl GpuDecoderLayer {
         let _ = self.hs;  // silence
         Ok(h)
     }
+
+    /// Decode-only forward (s=1, b=1).  Zero-alloc path using DecodeScratch.
+    /// `h` is the hidden state buffer [hs] (flat), modified in-place.
+    fn forward_decode(&self, h: &mut CudaSlice<f16>, cos: &CudaSlice<f16>, sin: &CudaSlice<f16>,
+                      kv: &mut GpuKvCache, layer_idx: usize, kv_start: usize,
+                      cuda: &CudaState, scratch: &mut DecodeScratch) -> Result<()>
+    {
+        let hs = self.hs;
+
+        // 1. Input RMSNorm → scratch.norm1
+        cuda.rms_norm_into_flat(h, hs, 1, &self.iln_w, self.eps, &mut scratch.norm1)?;
+
+        // 2. Fused QKV projection → scratch.qkv
+        cuda.linear_gpu_into_flat(&scratch.norm1, 1, hs, &self.qkv_w, &mut scratch.qkv)?;
+
+        // 3+4. Extract Q+KV → scratch.q_out + KV cache write
+        let q_dim = self.nqh * self.hd;
+        let kv_dim = self.nkvh * self.hd;
+        cuda.qkv_extract_into(
+            &mut kv.k[layer_idx], &mut kv.v[layer_idx],
+            &scratch.qkv, &self.qn_w, &self.kn_w, cos, sin,
+            self.nqh, self.nkvh, self.hd, q_dim, kv_dim,
+            kv.max_seq, kv_start, kv_start, self.eps,
+            &mut scratch.q_out,
+        )?;
+        let cur_len = kv_start + 1;
+
+        // 5. Attention — always use split path with fixed grid for stable graph topology
+        let scale = 1.0f32 / (self.hd as f32).sqrt();
+        let chunk_size: usize = if cur_len >= 2048 { 512 } else { 256 };
+        let max_chunks = (kv.max_seq + 255) / 256; // fixed upper bound for grid y-dim
+        cuda.fused_gqa_decode_split_into(
+            &scratch.q_out, &kv.k[layer_idx], &kv.v[layer_idx],
+            self.nkvh, kv.max_seq, cur_len, scale, chunk_size, max_chunks,
+            &mut scratch.split_part_out, &mut scratch.split_part_max, &mut scratch.split_part_sum,
+            &mut scratch.attn_out,
+        )?;
+
+        // 6. O-proj + residual: h += attn_out @ O^T  (cuBLAS beta=1)
+        cuda.linear_gpu_accum_slice(h, &scratch.attn_out, &self.o_w)?;
+
+        // 7. Post-attention RMSNorm → scratch.norm2
+        cuda.rms_norm_into_flat(h, hs, 1, &self.pln_w, self.eps, &mut scratch.norm2)?;
+
+        // 8. Gate-up projection → scratch.gate_up
+        cuda.linear_gpu_into_flat(&scratch.norm2, 1, hs, &self.gu_w, &mut scratch.gate_up)?;
+
+        // 9. SiLU*up → scratch.activated
+        cuda.silu_mul_split_into(&scratch.gate_up, 1, scratch.gate_up.len(), &mut scratch.activated)?;
+
+        // 10. Down projection + residual: h += activated @ D^T  (cuBLAS beta=1)
+        cuda.linear_gpu_accum_slice(h, &scratch.activated, &self.dp_w)?;
+
+        Ok(())
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1252,7 +1542,7 @@ pub(crate) struct GpuTextDecoder {
 }
 
 impl GpuTextDecoder {
-    pub fn load_with(cuda: Arc<CudaState>, weights: &HashMap<String, TensorData>, prefix: &str, config: &TextDecoderConfig) -> Result<Self> {
+    pub fn load_with(cuda: Arc<CudaState>, weights: &HashMap<String, RawTensor>, prefix: &str, config: &TextDecoderConfig) -> Result<Self> {
         let (embed_f16, embed_shape) = get_weight_f16(weights, &format!("{}.embed_tokens.weight", prefix))?;
         let embed_dev = cuda.upload_f16(&embed_f16)?;
         let embed_table = GpuWeight { data: embed_dev, rows: embed_shape[0], cols: embed_shape[1] };
@@ -1267,7 +1557,7 @@ impl GpuTextDecoder {
         Ok(Self { embed_table, layers, norm_w, eps: config.rms_norm_eps as f32, config: config.clone(), cuda })
     }
 
-    pub fn load(weights: &HashMap<String, TensorData>, prefix: &str, config: &TextDecoderConfig) -> Result<Self> {
+    pub fn load(weights: &HashMap<String, RawTensor>, prefix: &str, config: &TextDecoderConfig) -> Result<Self> {
         let cuda = Arc::new(CudaState::new(0)?);
         Self::load_with(cuda, weights, prefix, config)
     }
@@ -1345,6 +1635,31 @@ impl GpuTextDecoder {
         self.cuda.lm_head_argmax(&h, &self.embed_table)
     }
 
+    /// Zero-alloc decode: runs all layers via scratch buffers, final norm + lm_head,
+    /// writes argmax into `token_buf[slot]`.  The hidden state `h` must be [hs] f16.
+    pub fn forward_decode_scratch(&self, h: &mut CudaSlice<f16>, cos: &CudaSlice<f16>, sin: &CudaSlice<f16>,
+                                  kv: &mut GpuKvCache, kv_start: usize,
+                                  token_buf: &mut CudaSlice<i32>,
+                                  scratch: &mut DecodeScratch) -> Result<()>
+    {
+        // Run all layers, modifying h in-place
+        for (i, layer) in self.layers.iter().enumerate() {
+            layer.forward_decode(h, cos, sin, kv, i, kv_start, &self.cuda, scratch)?;
+        }
+        kv.cur_len = kv_start + 1;
+
+        // Final RMSNorm → scratch.final_norm
+        self.cuda.rms_norm_into_flat(h, scratch.hs, 1, &self.norm_w, self.eps, &mut scratch.final_norm)?;
+
+        // LM head → scratch.logits
+        self.cuda.linear_gpu_into_flat(&scratch.final_norm, 1, scratch.hs, &self.embed_table, &mut scratch.logits)?;
+
+        // Argmax into token_buf
+        self.cuda.argmax_into_flat(&scratch.logits, scratch.vocab, token_buf, 0)?;
+
+        Ok(())
+    }
+
     fn slice_last_token(&self, h: &GpuTensor) -> Result<GpuTensor> {
         let s = h.shape();
         assert_eq!(s.len(), 3);
@@ -1358,6 +1673,7 @@ impl GpuTextDecoder {
         Ok(GpuTensor::new(out, vec![b, 1, hidden]))
     }
 }
+
 
 // ═══════════════════════════════════════════════════════════════════════
 //  MRoPE cos/sin precompute (CPU side, then upload to GPU)

@@ -1,6 +1,10 @@
-//! Burn CUDA f16 benchmark & correctness tests.
+//! CUDA f16 transcribe benchmarks — correctness + RTFx timing.
 //!
 //! Run: cargo test --release --test transcribe_burn -- --ignored --nocapture
+//!
+//! Each test loads a Qwen3-ASR checkpoint via `Backend::best()` (CUDA by default) and
+//! runs end-to-end transcribe on a fixture, asserting transcript sanity and logging
+//! total wall time / RTFx.
 //!
 //! Models and fixtures resolve in this order:
 //!   1. Env var (`QWEN3_ASR_MODEL_06_DIR`, `QWEN3_ASR_FIXTURES_DIR`, etc.) — if set, used as-is.
@@ -37,9 +41,9 @@ fn test_q06_sample1() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true).try_init();
 
-    let device = qwen3_asr_burn::best_device();
+    let backend = qwen3_asr_burn::Backend::best().expect("best backend");
     let engine = qwen3_asr_burn::AsrInference::load(
-        std::path::Path::new(&model_dir_06()), device,
+        std::path::Path::new(&model_dir_06()), backend,
     ).expect("load 0.6B");
 
     let result = engine.transcribe(
@@ -66,9 +70,9 @@ fn test_q06_15s() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true).try_init();
 
-    let device = qwen3_asr_burn::best_device();
+    let backend = qwen3_asr_burn::Backend::best().expect("best backend");
     let engine = qwen3_asr_burn::AsrInference::load(
-        std::path::Path::new(&model_dir_06()), device,
+        std::path::Path::new(&model_dir_06()), backend,
     ).expect("load 0.6B");
 
     let t0 = Instant::now();
@@ -91,9 +95,9 @@ fn test_q06_30s() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true).try_init();
 
-    let device = qwen3_asr_burn::best_device();
+    let backend = qwen3_asr_burn::Backend::best().expect("best backend");
     let engine = qwen3_asr_burn::AsrInference::load(
-        std::path::Path::new(&model_dir_06()), device,
+        std::path::Path::new(&model_dir_06()), backend,
     ).expect("load 0.6B");
 
     let t0 = Instant::now();
@@ -116,9 +120,9 @@ fn test_q17_15s() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true).try_init();
 
-    let device = qwen3_asr_burn::best_device();
+    let backend = qwen3_asr_burn::Backend::best().expect("best backend");
     let engine = qwen3_asr_burn::AsrInference::load(
-        std::path::Path::new(&model_dir_17()), device,
+        std::path::Path::new(&model_dir_17()), backend,
     ).expect("load 1.7B");
 
     let t0 = Instant::now();
@@ -141,9 +145,9 @@ fn test_q17_30s() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true).try_init();
 
-    let device = qwen3_asr_burn::best_device();
+    let backend = qwen3_asr_burn::Backend::best().expect("best backend");
     let engine = qwen3_asr_burn::AsrInference::load(
-        std::path::Path::new(&model_dir_17()), device,
+        std::path::Path::new(&model_dir_17()), backend,
     ).expect("load 1.7B");
 
     let t0 = Instant::now();
@@ -165,9 +169,9 @@ fn test_q17_30s() {
 fn test_q06_90s() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true).try_init();
-    let device = qwen3_asr_burn::best_device();
+    let backend = qwen3_asr_burn::Backend::best().expect("best backend");
     let engine = qwen3_asr_burn::AsrInference::load(
-        std::path::Path::new(&model_dir_06()), device,
+        std::path::Path::new(&model_dir_06()), backend,
     ).expect("load 0.6B");
     let t0 = std::time::Instant::now();
     let result = engine.transcribe(
@@ -185,9 +189,9 @@ fn test_q06_90s() {
 fn test_q06_89s_ja() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true).try_init();
-    let device = qwen3_asr_burn::best_device();
+    let backend = qwen3_asr_burn::Backend::best().expect("best backend");
     let engine = qwen3_asr_burn::AsrInference::load(
-        std::path::Path::new(&model_dir_06()), device,
+        std::path::Path::new(&model_dir_06()), backend,
     ).expect("load 0.6B");
     let t0 = std::time::Instant::now();
     let result = engine.transcribe(
@@ -206,9 +210,9 @@ fn test_q06_89s_ja() {
 fn test_q17_89s_ja() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true).try_init();
-    let device = qwen3_asr_burn::best_device();
+    let backend = qwen3_asr_burn::Backend::best().expect("best backend");
     let engine = qwen3_asr_burn::AsrInference::load(
-        std::path::Path::new(&model_dir_17()), device,
+        std::path::Path::new(&model_dir_17()), backend,
     ).expect("load 1.7B");
     let t0 = std::time::Instant::now();
     let result = engine.transcribe(
@@ -227,9 +231,9 @@ fn test_q17_89s_ja() {
 fn test_q06_180s() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true).try_init();
-    let device = qwen3_asr_burn::best_device();
+    let backend = qwen3_asr_burn::Backend::best().expect("best backend");
     let engine = qwen3_asr_burn::AsrInference::load(
-        std::path::Path::new(&model_dir_06()), device,
+        std::path::Path::new(&model_dir_06()), backend,
     ).expect("load 0.6B");
     let t0 = std::time::Instant::now();
     let result = engine.transcribe(
@@ -247,9 +251,9 @@ fn test_q06_180s() {
 fn test_q06_180s_en() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true).try_init();
-    let device = qwen3_asr_burn::best_device();
+    let backend = qwen3_asr_burn::Backend::best().expect("best backend");
     let engine = qwen3_asr_burn::AsrInference::load(
-        std::path::Path::new(&model_dir_06()), device,
+        std::path::Path::new(&model_dir_06()), backend,
     ).expect("load 0.6B");
     let t0 = std::time::Instant::now();
     let result = engine.transcribe(
@@ -267,9 +271,9 @@ fn test_q06_180s_en() {
 fn test_q17_90s() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true).try_init();
-    let device = qwen3_asr_burn::best_device();
+    let backend = qwen3_asr_burn::Backend::best().expect("best backend");
     let engine = qwen3_asr_burn::AsrInference::load(
-        std::path::Path::new(&model_dir_17()), device,
+        std::path::Path::new(&model_dir_17()), backend,
     ).expect("load 1.7B");
     let t0 = std::time::Instant::now();
     let result = engine.transcribe(
@@ -287,9 +291,9 @@ fn test_q17_90s() {
 fn test_q17_180s() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true).try_init();
-    let device = qwen3_asr_burn::best_device();
+    let backend = qwen3_asr_burn::Backend::best().expect("best backend");
     let engine = qwen3_asr_burn::AsrInference::load(
-        std::path::Path::new(&model_dir_17()), device,
+        std::path::Path::new(&model_dir_17()), backend,
     ).expect("load 1.7B");
     let t0 = std::time::Instant::now();
     let result = engine.transcribe(
@@ -307,9 +311,9 @@ fn test_q17_180s() {
 fn test_q17_180s_en() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true).try_init();
-    let device = qwen3_asr_burn::best_device();
+    let backend = qwen3_asr_burn::Backend::best().expect("best backend");
     let engine = qwen3_asr_burn::AsrInference::load(
-        std::path::Path::new(&model_dir_17()), device,
+        std::path::Path::new(&model_dir_17()), backend,
     ).expect("load 1.7B");
     let t0 = std::time::Instant::now();
     let result = engine.transcribe(

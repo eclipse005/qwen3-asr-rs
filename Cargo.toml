@@ -2,18 +2,15 @@
 name = "qwen3-asr-burn"
 version = "0.2.2"
 edition = "2021"
-description = "Local speech-to-text (ASR) in Rust — Burn backend (CUDA/ROCm/Metal/Vulkan/CPU)"
+description = "Local speech-to-text (ASR) in Rust — hand-written CUDA engine (end-to-end) + CPU text decoder"
 license = "MIT"
 
 [dependencies]
-burn = { version = "0.21", default-features = false, features = ["std"] }
-burn-cubecl = { version = "0.21", optional = true }
-cubecl = { version = "0.10", optional = true }
 half = { version = "2" }
-cudarc = { version = "0.19", features = ["cublas", "f16"], optional = true }
-# gemm + rayon power the CPU-only text-decoder engine (cpu_engine.rs).  Same crates burn-flex
-# uses internally, but we drive them directly so we can force Rayon parallelism on the
-# m=1 GEMVs that burn-flex leaves single-threaded.
+cudarc = { version = "0.19", features = ["cublas", "f16", "cuda-version-from-build-system", "cuda-12080"], optional = true }
+# gemm + rayon power the CPU-only text-decoder engine (cpu_engine.rs).  We drive them
+# directly so we can force Rayon parallelism on the m=1 GEMVs that typical GEMM thresholds
+# leave single-threaded.
 gemm = { version = "0.18", optional = true }
 rayon = { version = "1.10", optional = true }
 tokenizers = { version = "0.22", features = ["onig"] }
@@ -30,12 +27,13 @@ thiserror = "2"
 reqwest = { version = "0.12", features = ["blocking"], optional = true }
 
 [features]
+# Default = cuda: end-to-end transcribe works out of the box on a CUDA-capable host.
+# CPU text decoder is implemented (use --no-default-features --features cpu),
+# but the CPU audio encoder is not yet implemented — transcribe() will fail loudly
+# in that configuration. See ROADMAP.md.
 default = ["cuda"]
-cuda  = ["burn/cuda", "dep:burn-cubecl", "dep:cubecl", "dep:cudarc", "cubecl/cuda"]
-rocm  = ["burn/rocm", "dep:burn-cubecl", "dep:cubecl", "cubecl/rocm"]
-metal = ["burn/metal", "dep:burn-cubecl", "dep:cubecl", "cubecl/metal"]
-vulkan = ["burn/wgpu"]
-cpu   = ["burn/flex", "dep:gemm", "dep:rayon"]
+cuda = ["dep:cudarc"]
+cpu = ["dep:gemm", "dep:rayon"]
 hub = ["dep:reqwest"]
 
 [dev-dependencies]
