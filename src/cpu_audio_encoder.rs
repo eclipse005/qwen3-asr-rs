@@ -358,3 +358,157 @@ fn load_bias(weights: &HashMap<String, RawTensor>, name: &str) -> Result<Vec<f32
     let (data, _) = weights.get(name).ok_or_else(|| anyhow::anyhow!("bias not found: {}", name))?.as_f32()?;
     Ok(data)
 }
+
+pub(crate) struct CpuAudioAttention {
+    q_proj: CpuAudioLinear,
+    k_proj: CpuAudioLinear,
+    v_proj: CpuAudioLinear,
+    out_proj: CpuAudioLinear,
+    num_heads: usize,
+    head_dim: usize,
+}
+
+impl CpuAudioAttention {
+    pub(crate) fn load(
+        weights: &HashMap<String, RawTensor>,
+        prefix: &str,
+        nh: usize,
+        d_model: usize,
+    ) -> Result<Self> {
+        let hd = d_model / nh;
+        Ok(Self {
+            q_proj: CpuAudioLinear::load(weights, &format!("{}.q_proj", prefix))?,
+            k_proj: CpuAudioLinear::load(weights, &format!("{}.k_proj", prefix))?,
+            v_proj: CpuAudioLinear::load(weights, &format!("{}.v_proj", prefix))?,
+            out_proj: CpuAudioLinear::load(weights, &format!("{}.out_proj", prefix))?,
+            num_heads: nh,
+            head_dim: hd,
+        })
+    }
+
+    /// x [b, s, d_model] → [b, s, d_model]. ws: window size for attention.
+    pub(crate) fn forward(
+        &self,
+        x: &CpuTensor,
+        ws: Option<usize>,
+    ) -> Result<CpuTensor> {
+        let b = x.shape[0];
+        let s = x.shape[1];
+        let dm = x.shape[2];
+        let nh = self.num_heads;
+        let hd = self.head_dim;
+
+        // Project Q, K, V.
+        let q = self.q_proj.forward(x)?;
+        let k = self.k_proj.forward(x)?;
+        let v = self.v_proj.forward(x)?;
+
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        let window = ws.filter(|&w| w > 0 && w < s);
+
+        let attn_out = if let Some(w) = window {
+            // Windowed: process chunks of `w` tokens, each chunk attends only to itself.
+            let mut out = vec![0.0f32; b * nh * s * hd];
+            for st in (0..s).step_by(w) {
+                let len = w.min(s - st);
+                let q_chunk = slice_dim1(&q, st, len);
+                let k_chunk = slice_dim1(&k, st, len);
+                let v_chunk = slice_dim1(&v, st, len);
+                let o = attention_window(&q_chunk, &k_chunk, &v_chunk, b, nh, len, hd, scale);
+                scatter_dim2(&mut out, &o, b, nh, s, hd, st, len);
+            }
+            out
+        } else {
+            // Full attention (rare in this model — fallback).
+            attention_window(&q, &k, &v, b, nh, s, hd, scale)
+        };
+
+        // Reshape [b, nh, s, hd] → [b, s, nh, hd] (swap dims 1 and 2) → [b, s, nh*hd].
+        let mut flat = vec![0.0f32; b * s * nh * hd];
+        for ib in 0..b {
+            for ih in 0..nh {
+                for is_ in 0..s {
+                    for jd in 0..hd {
+                        let src = ((ib * nh + ih) * s + is_) * hd + jd;
+                        let dst = ((ib * s + is_) * nh + ih) * hd + jd;
+                        flat[dst] = attn_out[src];
+                    }
+                }
+            }
+        }
+        let attn_flat = CpuTensor::new(flat, vec![b, s, nh * hd]);
+        self.out_proj.forward(&attn_flat)
+    }
+}
+
+/// x: [b, s, dm] → out_chunk: [b, len, dm] for s in [st, st+len).
+fn slice_dim1(x: &CpuTensor, st: usize, len: usize) -> CpuTensor {
+    let b = x.shape[0];
+    let dm = x.shape[2];
+    let mut data = vec![0.0f32; b * len * dm];
+    for ib in 0..b {
+        for i in 0..len {
+            for j in 0..dm {
+                data[(ib * len + i) * dm + j] = x.data[((ib * x.shape[1] + st + i) * dm + j)];
+            }
+        }
+    }
+    CpuTensor::new(data, vec![b, len, dm])
+}
+
+/// Scatter `src [b, nh, len, hd]` into `dst [b, nh, s, hd]` at `dst[..., st:st+len, ...]`.
+fn scatter_dim2(dst: &mut [f32], src: &[f32], b: usize, nh: usize, s: usize, hd: usize, st: usize, len: usize) {
+    for ib in 0..b {
+        for ih in 0..nh {
+            for i in 0..len {
+                for jd in 0..hd {
+                    let sidx = ((ib * nh + ih) * len + i) * hd + jd;
+                    let didx = ((ib * nh + ih) * s + (st + i)) * hd + jd;
+                    dst[didx] = src[sidx];
+                }
+            }
+        }
+    }
+}
+
+/// q,k,v: [b, s, dm] (treated as [b, s, nh*hd]). Returns [b, nh, s, hd].
+/// Single-call attention (windowed uses this with s = chunk_len).
+fn attention_window(
+    q: &CpuTensor, k: &CpuTensor, v: &CpuTensor,
+    b: usize, nh: usize, s: usize, hd: usize, scale: f32,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; b * nh * s * hd];
+    for ib in 0..b {
+        for ih in 0..nh {
+            for is_ in 0..s {
+                let mut scores = vec![0.0f32; s];
+                let mut max_s = f32::NEG_INFINITY;
+                for it in 0..s {
+                    let mut dot = 0.0f32;
+                    for jd in 0..hd {
+                        let qv = q.data[((ib * s + is_) * nh * hd + ih * hd) + jd];
+                        let kv = k.data[((ib * s + it) * nh * hd + ih * hd) + jd];
+                        dot += qv * kv;
+                    }
+                    let s_ = dot * scale;
+                    scores[it] = s_;
+                    if s_ > max_s { max_s = s_; }
+                }
+                let mut sum = 0.0f32;
+                for t in 0..s {
+                    scores[t] = (scores[t] - max_s).exp();
+                    sum += scores[t];
+                }
+                let inv = 1.0 / sum;
+                for it in 0..s {
+                    let w = scores[it] * inv;
+                    for jd in 0..hd {
+                        let vv = v.data[((ib * s + it) * nh * hd + ih * hd) + jd];
+                        out[((ib * nh + ih) * s + is_) * hd + jd] += w * vv;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
