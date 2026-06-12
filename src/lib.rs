@@ -12,6 +12,8 @@ mod cudarc_engine;
 mod gpu_audio_encoder;
 #[cfg(feature = "cpu")]
 mod cpu_engine;
+#[cfg(feature = "cpu")]
+mod cpu_audio_encoder;
 
 pub use backend::Backend;
 pub use error::{AsrError, Result};
