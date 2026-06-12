@@ -18,59 +18,8 @@ use gemm::{gemm, Parallelism};
 use std::collections::HashMap;
 
 use crate::config::AudioEncoderConfig;
-use crate::cpu_engine::{CpuTensor, CpuWeight};
+use crate::cpu_engine::{linear, CpuTensor, CpuWeight};
 use crate::raw_tensor::RawTensor;
-
-// ─── Linear + LayerNorm primitives ─────────────────────────────────
-
-/// Local copy of `cpu_engine::linear` (which is private). Mirrors its body
-/// exactly: x [m, k] @ W^T [n, k] → [m, n], with m=1 hand-written GEMV path.
-fn linear(x: &CpuTensor, w: &CpuWeight) -> CpuTensor {
-    let nd = x.shape.len();
-    let m: usize = x.shape[..nd - 1].iter().product();
-    let k = x.shape[nd - 1];
-    let n = w.rows;
-    debug_assert_eq!(k, w.cols, "linear K mismatch: x last={} vs W cols={}", k, w.cols);
-    let mut out_shape = x.shape.clone();
-    out_shape[nd - 1] = n;
-    let mut out = vec![0.0f32; m * n];
-    if m == 1 {
-        // Hand-written GEMV for the m=1 case (lifts burn-flex's m=1 perf cliff).
-        for j in 0..n {
-            let w_row = &w.data[j * k..(j + 1) * k];
-            let mut acc = 0.0f32;
-            for i in 0..k { acc += x.data[i] * w_row[i]; }
-            out[j] = acc;
-        }
-        return CpuTensor::new(out, out_shape);
-    }
-    gemm_row_major(&mut out, &x.data, w, m, 0.0);
-    CpuTensor::new(out, out_shape)
-}
-
-fn gemm_row_major(out: &mut [f32], x: &[f32], w: &CpuWeight, m: usize, beta: f32) {
-    let n = w.rows;
-    let k = w.cols;
-    unsafe {
-        gemm(
-            m, n, k,
-            out.as_mut_ptr(),
-            1,
-            n as isize,
-            beta != 0.0,
-            x.as_ptr(),
-            1,
-            k as isize,
-            w.data.as_ptr(),
-            k as isize,
-            1,
-            beta,
-            1.0,
-            false, false, false,
-            Parallelism::Rayon(0),
-        );
-    }
-}
 
 // ─── Linear + LayerNorm primitives ─────────────────────────────────
 
@@ -511,4 +460,117 @@ fn attention_window(
         }
     }
     out
+}
+
+pub(crate) struct CpuAudioFfn {
+    fc1: CpuAudioLinear,
+    fc2: CpuAudioLinear,
+}
+
+impl CpuAudioFfn {
+    pub(crate) fn load(weights: &HashMap<String, RawTensor>, prefix: &str) -> Result<Self> {
+        Ok(Self {
+            fc1: CpuAudioLinear::load(weights, &format!("{}.fc1", prefix))?,
+            fc2: CpuAudioLinear::load(weights, &format!("{}.fc2", prefix))?,
+        })
+    }
+
+    pub(crate) fn forward(&self, x: &CpuTensor) -> Result<CpuTensor> {
+        let mut h = self.fc1.forward(x)?;
+        gelu_inplace(&mut h);
+        self.fc2.forward(&h)
+    }
+}
+
+pub(crate) struct CpuAudioLayer {
+    sln: CpuAudioLayerNorm,
+    attn: CpuAudioAttention,
+    fln: CpuAudioLayerNorm,
+    ffn: CpuAudioFfn,
+}
+
+impl CpuAudioLayer {
+    pub(crate) fn load(
+        weights: &HashMap<String, RawTensor>,
+        prefix: &str,
+        nh: usize,
+        d_model: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            sln: CpuAudioLayerNorm::load(weights, &format!("{}.self_attn_layer_norm", prefix), 1e-5)?,
+            attn: CpuAudioAttention::load(weights, &format!("{}.self_attn", prefix), nh, d_model)?,
+            fln: CpuAudioLayerNorm::load(weights, &format!("{}.final_layer_norm", prefix), 1e-5)?,
+            ffn: CpuAudioFfn::load(weights, prefix)?,
+        })
+    }
+
+    /// x: [b, s, d_model] consumed; returns post-residual h of same shape.
+    pub(crate) fn forward(&self, x: CpuTensor, ws: Option<usize>) -> Result<CpuTensor> {
+        let normed = self.sln.forward(&x);
+        let attn_out = self.attn.forward(&normed, ws)?;
+        let mut x1_data = x.data.clone();
+        for (a, b) in x1_data.iter_mut().zip(attn_out.data.iter()) { *a += *b; }
+        let x1 = CpuTensor::new(x1_data, x.shape.clone());
+        let normed2 = self.fln.forward(&x1);
+        let ffn_out = self.ffn.forward(&normed2)?;
+        let mut x2_data = x1.data;
+        for (a, b) in x2_data.iter_mut().zip(ffn_out.data.iter()) { *a += *b; }
+        Ok(CpuTensor::new(x2_data, x1.shape))
+    }
+}
+
+/// Replicate of `gpu_audio_encoder.rs::feo` (line 389-392).
+fn feo(ifr: usize) -> usize {
+    let f = |l: usize| -> usize { (l - 1) / 2 + 1 };
+    f(f(f(ifr)))
+}
+
+pub(crate) struct CpuAudioEncoder {
+    conv_stem: CpuConvStem,
+    layers: Vec<CpuAudioLayer>,
+    ln_post: CpuAudioLayerNorm,
+    proj1: CpuAudioLinear,
+    proj2: CpuAudioLinear,
+    config: AudioEncoderConfig,
+}
+
+impl CpuAudioEncoder {
+    pub(crate) fn load(
+        weights: &HashMap<String, RawTensor>,
+        prefix: &str,
+        config: &AudioEncoderConfig,
+    ) -> Result<Self> {
+        let dm = config.d_model;
+        let nh = config.encoder_attention_heads;
+        let mut layers = Vec::with_capacity(config.encoder_layers);
+        for i in 0..config.encoder_layers {
+            layers.push(CpuAudioLayer::load(weights, &format!("{}.layers.{}", prefix, i), nh, dm)?);
+        }
+        let ln_post = CpuAudioLayerNorm::load(weights, &format!("{}.ln_post", prefix), 1e-5)?;
+        let proj1 = CpuAudioLinear::load(weights, &format!("{}.proj1", prefix))?;
+        let proj2 = CpuAudioLinear::load(weights, &format!("{}.proj2", prefix))?;
+        let conv_stem = CpuConvStem::load(weights, prefix, config)?;
+        Ok(Self { conv_stem, layers, ln_post, proj1, proj2, config: config.clone() })
+    }
+
+    /// mel: [n_mels * T_mel] flat. Returns [n_total, output_dim] flat.
+    pub(crate) fn forward(&self, mel: &[f32], n_mels: usize, mel_len: usize) -> Result<Vec<f32>> {
+        let (conv_data, n_total) = self.conv_stem.forward(mel, n_mels, mel_len)?;
+        let dm = self.config.d_model;
+
+        let cs2 = self.config.n_window * 2;
+        let tpc = feo(cs2);
+        let cpw = self.config.n_window_infer / cs2;
+        let ws = tpc * cpw;
+        let mut h = CpuTensor::new(conv_data, vec![1, n_total, dm]);
+        for layer in &self.layers {
+            h = layer.forward(h, Some(ws))?;
+        }
+
+        let h = self.ln_post.forward(&h);
+        let mut h = self.proj1.forward(&h)?;
+        gelu_inplace(&mut h);
+        let h = self.proj2.forward(&h)?;
+        Ok(h.data)
+    }
 }

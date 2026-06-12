@@ -67,7 +67,7 @@ pub(crate) struct CpuWeight {
 // element (i, j) is at i*n + j, so cs=1, rs=n.  Same for x.  W^T conceptually is [k, n] with
 // element (i, j) = W[j, i]; since W is row-major [n, k] (W[j, i] at j*k + i), B's cs = k, rs = 1.
 
-fn linear(x: &CpuTensor, w: &CpuWeight) -> CpuTensor {
+pub(crate) fn linear(x: &CpuTensor, w: &CpuWeight) -> CpuTensor {
     let nd = x.shape.len();
     let m: usize = x.shape[..nd - 1].iter().product();
     let k = x.shape[nd - 1];
