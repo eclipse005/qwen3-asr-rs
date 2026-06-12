@@ -7,11 +7,11 @@
 //!   20-core machine spends decode on one core.
 //! - `rayon` parallelises every hand-written elementwise/reduction op (rms_norm,
 //!   silu_mul, attention) across heads or rows.
-//! - All tensors are f32 (Vec<f32>) — x86 has no native f16 SIMD outside
-//!   Sapphire/Granite Rapids AVX-512-FP16, so f32 ends up faster than f16 with upcast.
+//! - Activations are f32 (Vec<f32>). **Weights are stored as f16** and read directly
+//!   by the m=1 GEMV (halved memory bandwidth → faster on memory-bound decode).
+//!   For prefill (m>1), weights are converted to f32 before `gemm` crate calls.
 //! - KV cache is pre-allocated per layer (Vec<f32> sized [b, nkvh, max_seq, d]).
-//! - Weights are loaded once into `CpuWeight` (Vec<f32>); the embed table is reused
-//!   as the lm_head weight (Qwen3 ties them).
+//! - The embed table is reused as the lm_head weight (Qwen3 ties them).
 //!
 //! This module is `#[cfg(feature = "cpu")]` only — the CUDA path is untouched.
 
@@ -54,6 +54,24 @@ pub(crate) struct CpuWeight {
     pub data: Vec<f32>,
     pub rows: usize,   // = out_features (N)
     pub cols: usize,   // = in_features  (K)
+}
+
+/// Weight matrix stored as f16 — halved memory vs f32.
+/// Read directly by m=1 GEMV (halved bandwidth for memory-bound decode).
+/// Converted to f32 on-the-fly for m>1 GEMM (prefill).
+pub(crate) struct CpuWeightF16 {
+    pub data: Vec<half::f16>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl CpuWeightF16 {
+    /// Convert f16 → f32 with rayon. Used for prefill (m>1) path only.
+    /// Decode (m=1) reads f16 directly via `linear_gemv_f16`.
+    fn to_f32_weight(&self) -> CpuWeight {
+        let data: Vec<f32> = self.data.par_iter().map(|v| v.to_f32()).collect();
+        CpuWeight { data, rows: self.rows, cols: self.cols }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -99,6 +117,45 @@ fn linear_accum(out: &mut CpuTensor, x: &CpuTensor, w: &CpuWeight) {
         return;
     }
     gemm_row_major(&mut out.data, &x.data, w, m, 1.0);
+}
+
+// ─── f16-weight variants (decode: direct f16 read; prefill: convert to f32) ────
+
+/// `linear()` for f16 weights. Decode (m=1) reads f16 directly; prefill converts to f32.
+fn linear_f16(x: &CpuTensor, w: &CpuWeightF16) -> CpuTensor {
+    let nd = x.shape.len();
+    let m: usize = x.shape[..nd - 1].iter().product();
+    let k = x.shape[nd - 1];
+    let n = w.rows;
+    assert_eq!(k, w.cols, "linear_f16 K mismatch: x last={} vs W cols={}", k, w.cols);
+    let mut out_shape = x.shape.clone();
+    out_shape[nd - 1] = n;
+    if m == 1 {
+        let out = linear_gemv_f16(&x.data, w);
+        return CpuTensor::new(out, out_shape);
+    }
+    // Prefill: convert f16 → f32 for gemm crate.
+    let w_f32 = w.to_f32_weight();
+    let mut out = vec![0.0f32; m * n];
+    gemm_row_major(&mut out, &x.data, &w_f32, m, 0.0);
+    CpuTensor::new(out, out_shape)
+}
+
+/// `linear_accum()` for f16 weights.
+fn linear_accum_f16(out: &mut CpuTensor, x: &CpuTensor, w: &CpuWeightF16) {
+    let nd = x.shape.len();
+    let m: usize = x.shape[..nd - 1].iter().product();
+    let k = x.shape[nd - 1];
+    let n = w.rows;
+    assert_eq!(k, w.cols);
+    assert_eq!(out.numel(), m * n);
+    if m == 1 {
+        let add = linear_gemv_f16(&x.data, w);
+        for (o, a) in out.data.iter_mut().zip(add.iter()) { *o += *a; }
+        return;
+    }
+    let w_f32 = w.to_f32_weight();
+    gemm_row_major(&mut out.data, &x.data, &w_f32, m, 1.0);
 }
 
 // y[i, j] = sum_k x[i, k] * W[j, k] + beta * y[i, j].  Row-major throughout.
@@ -152,6 +209,33 @@ fn linear_gemv(x: &[f32], w: &CpuWeight) -> Vec<f32> {
             // f32 sum is fine for inference (vocab logits don't need extra precision).
             let mut acc = 0.0f32;
             for j in 0..k { acc += x[j] * w_row[j]; }
+            *o = acc;
+        }
+    });
+    out
+}
+
+/// Same as `linear_gemv` but reads f16 weights directly — halved memory bandwidth.
+/// For m=1 GEMV the bottleneck is streaming the weight matrix from DRAM; reading
+/// 2 bytes/element instead of 4 can be ~2x faster on bandwidth-limited systems.
+/// The f16→f32 conversion happens in-register alongside the FMA.
+fn linear_gemv_f16(x: &[f32], w: &CpuWeightF16) -> Vec<f32> {
+    let n = w.rows;
+    let k = w.cols;
+    debug_assert_eq!(x.len(), k);
+    let mut out = vec![0.0f32; n];
+    let chunk = (n / (rayon::current_num_threads() * 4)).max(64).min(2048);
+    out.par_chunks_mut(chunk).enumerate().for_each(|(ci, slab)| {
+        let row0 = ci * chunk;
+        for (offset, o) in slab.iter_mut().enumerate() {
+            let row = row0 + offset;
+            let w_row = &w.data[row * k..(row + 1) * k];
+            let mut acc = 0.0f32;
+            for j in 0..k {
+                // f16→f32 conversion + multiply in one expression; compiler
+                // can batch the conversions with SSE/AVX auto-vectorization.
+                acc += x[j] * w_row[j].to_f32();
+            }
             *o = acc;
         }
     });
@@ -239,6 +323,20 @@ pub fn embed_lookup(table: &CpuWeight, ids: &[i64]) -> CpuTensor {
         .for_each(|(o, &id)| {
             let src = &table.data[(id as usize) * d..(id as usize + 1) * d];
             o.copy_from_slice(src);
+        });
+    CpuTensor::new(out, vec![n, d])
+}
+
+/// Embedding lookup from f16 table — converts each row to f32 on the fly.
+pub fn embed_lookup_f16(table: &CpuWeightF16, ids: &[i64]) -> CpuTensor {
+    let n = ids.len();
+    let d = table.cols;
+    let mut out = vec![0.0f32; n * d];
+    out.par_chunks_mut(d)
+        .zip(ids.par_iter())
+        .for_each(|(o, &id)| {
+            let src = &table.data[(id as usize) * d..(id as usize + 1) * d];
+            for j in 0..d { o[j] = src[j].to_f32(); }
         });
     CpuTensor::new(out, vec![n, d])
 }
@@ -432,10 +530,10 @@ pub(crate) struct CpuDecoderLayer {
     pub pln_w: Vec<f32>,
     pub qn_w: Vec<f32>,
     pub kn_w: Vec<f32>,
-    pub qkv_w: CpuWeight,
-    pub o_w: CpuWeight,
-    pub gu_w: CpuWeight,   // [2*inter, hidden]
-    pub dp_w: CpuWeight,   // [hidden, inter]
+    pub qkv_w: CpuWeightF16,
+    pub o_w: CpuWeightF16,
+    pub gu_w: CpuWeightF16,   // [2*inter, hidden]
+    pub dp_w: CpuWeightF16,   // [hidden, inter]
     pub nqh: usize, pub nkvh: usize, pub hd: usize, pub eps: f32,
 }
 
@@ -450,10 +548,10 @@ impl CpuDecoderLayer {
             pln_w: load_vec_f32(weights, &format!("{}.post_attention_layernorm.weight", prefix))?,
             qn_w: load_vec_f32(weights, &format!("{}.self_attn.q_norm.weight", prefix))?,
             kn_w: load_vec_f32(weights, &format!("{}.self_attn.k_norm.weight", prefix))?,
-            qkv_w: load_fused_qkv(weights, &format!("{}.self_attn", prefix))?,
-            o_w: load_weight(weights, &format!("{}.self_attn.o_proj.weight", prefix))?,
-            gu_w: load_fused_gate_up(weights, &format!("{}.mlp", prefix))?,
-            dp_w: load_weight(weights, &format!("{}.mlp.down_proj.weight", prefix))?,
+            qkv_w: load_fused_qkv_f16(weights, &format!("{}.self_attn", prefix))?,
+            o_w: load_weight_f16(weights, &format!("{}.self_attn.o_proj.weight", prefix))?,
+            gu_w: load_fused_gate_up_f16(weights, &format!("{}.mlp", prefix))?,
+            dp_w: load_weight_f16(weights, &format!("{}.mlp.down_proj.weight", prefix))?,
             nqh: cfg.num_attention_heads,
             nkvh: cfg.num_key_value_heads,
             hd: cfg.head_dim,
@@ -475,7 +573,7 @@ impl CpuDecoderLayer {
         let normed = rms_norm(&x, &self.iln_w, self.eps);
 
         // 2. Fused QKV linear
-        let qkv = linear(&normed, &self.qkv_w);
+        let qkv = linear_f16(&normed, &self.qkv_w);
         drop(normed);
         let q_dim = self.nqh * self.hd;
         let kv_dim = self.nkvh * self.hd;
@@ -506,20 +604,20 @@ impl CpuDecoderLayer {
         //    produced it, so we can reshape directly to [b, s, nqh*hd] — no swap needed.
         let attn_flat = attn_out.reshape(vec![b, s, self.nqh * self.hd]);
         let mut h = x;
-        linear_accum(&mut h, &attn_flat, &self.o_w);
+        linear_accum_f16(&mut h, &attn_flat, &self.o_w);
         drop(attn_flat);
 
         // 6. Post-attn RMSNorm
         let normed2 = rms_norm(&h, &self.pln_w, self.eps);
 
         // 7. Gate-up linear → SiLU·up
-        let gu = linear(&normed2, &self.gu_w);
+        let gu = linear_f16(&normed2, &self.gu_w);
         drop(normed2);
         let activated = silu_mul_split(&gu);
         drop(gu);
 
         // 8. Down projection with residual add
-        linear_accum(&mut h, &activated, &self.dp_w);
+        linear_accum_f16(&mut h, &activated, &self.dp_w);
         h
     }
 }
@@ -656,16 +754,16 @@ impl CpuKvCache {
 // ═══════════════════════════════════════════════════════════════════════
 
 pub(crate) struct CpuTextDecoder {
-    pub embed_table: CpuWeight,   // [vocab, hidden] (reused as lm_head)
+    pub embed_table: CpuWeightF16,   // [vocab, hidden] (reused as lm_head)
     pub layers: Vec<CpuDecoderLayer>,
-    pub norm_w: Vec<f32>,         // [hidden]
+    pub norm_w: Vec<f32>,            // [hidden]
     pub eps: f32,
     pub config: TextDecoderConfig,
 }
 
 impl CpuTextDecoder {
     pub fn load(weights: &HashMap<String, RawTensor>, prefix: &str, config: &TextDecoderConfig) -> Result<Self> {
-        let embed_table = load_weight(weights, &format!("{}.embed_tokens.weight", prefix))?;
+        let embed_table = load_weight_f16(weights, &format!("{}.embed_tokens.weight", prefix))?;
         let norm_w = load_vec_f32(weights, &format!("{}.norm.weight", prefix))?;
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
@@ -676,7 +774,7 @@ impl CpuTextDecoder {
 
     /// Embed ids into [n, hidden] tensor.
     pub fn embed_ids(&self, ids: &[i64]) -> CpuTensor {
-        embed_lookup(&self.embed_table, ids)
+        embed_lookup_f16(&self.embed_table, ids)
     }
 
     /// Forward pass.
@@ -716,9 +814,8 @@ impl CpuTextDecoder {
             h
         };
 
-        // lm_head (shared with embed_table): hand-written m=1 GEMV is ~3-4x faster than
-        // gemm crate's m=1 path on the 304MB Qwen3 lm_head — saves 20+ms per decode step.
-        let logits_vec = linear_gemv(&h.data, &self.embed_table);
+        // lm_head (shared with embed_table): hand-written m=1 GEMV reading f16 directly.
+        let logits_vec = linear_gemv_f16(&h.data, &self.embed_table);
         let vocab = self.embed_table.rows;
         let logits = CpuTensor::new(logits_vec, vec![1, 1, vocab]);
         let post_ms = t_post.elapsed().as_secs_f64() * 1000.0;
@@ -795,34 +892,40 @@ fn load_vec_f32(weights: &HashMap<String, RawTensor>, name: &str) -> Result<Vec<
     Ok(data)
 }
 
-fn load_weight(weights: &HashMap<String, RawTensor>, name: &str) -> Result<CpuWeight> {
-    let (data, shape) = load_f32_vec(weights, name)?;
-    assert_eq!(shape.len(), 2, "weight {} should be 2D", name);
-    Ok(CpuWeight { data, rows: shape[0], cols: shape[1] })
+fn load_f16_vec(weights: &HashMap<String, RawTensor>, name: &str) -> Result<(Vec<half::f16>, Vec<usize>)> {
+    let td = weights.get(name).ok_or_else(|| anyhow::anyhow!("weight not found: {}", name))?;
+    let (data, shape) = td.as_f16()?;
+    Ok((data, shape))
 }
 
-/// Load Q+K+V projections and concatenate into a single [q_dim + 2*kv_dim, hidden] matrix.
-fn load_fused_qkv(weights: &HashMap<String, RawTensor>, prefix: &str) -> Result<CpuWeight> {
-    let (qw, qs) = load_f32_vec(weights, &format!("{}.q_proj.weight", prefix))?;
-    let (kw, ks) = load_f32_vec(weights, &format!("{}.k_proj.weight", prefix))?;
-    let (vw, vs) = load_f32_vec(weights, &format!("{}.v_proj.weight", prefix))?;
+fn load_weight_f16(weights: &HashMap<String, RawTensor>, name: &str) -> Result<CpuWeightF16> {
+    let (data, shape) = load_f16_vec(weights, name)?;
+    assert_eq!(shape.len(), 2, "weight {} should be 2D", name);
+    Ok(CpuWeightF16 { data, rows: shape[0], cols: shape[1] })
+}
+
+/// Load Q+K+V projections and concatenate into a single [q_dim + 2*kv_dim, hidden] f16 matrix.
+fn load_fused_qkv_f16(weights: &HashMap<String, RawTensor>, prefix: &str) -> Result<CpuWeightF16> {
+    let (qw, qs) = load_f16_vec(weights, &format!("{}.q_proj.weight", prefix))?;
+    let (kw, ks) = load_f16_vec(weights, &format!("{}.k_proj.weight", prefix))?;
+    let (vw, vs) = load_f16_vec(weights, &format!("{}.v_proj.weight", prefix))?;
     let q_dim = qs[0]; let kv_dim = ks[0]; let hidden = qs[1];
     assert_eq!(ks[1], hidden); assert_eq!(vs[1], hidden);
     let mut fused = Vec::with_capacity((q_dim + 2 * kv_dim) * hidden);
     fused.extend_from_slice(&qw);
     fused.extend_from_slice(&kw);
     fused.extend_from_slice(&vw);
-    Ok(CpuWeight { data: fused, rows: q_dim + 2 * kv_dim, cols: hidden })
+    Ok(CpuWeightF16 { data: fused, rows: q_dim + 2 * kv_dim, cols: hidden })
 }
 
-/// Load gate_proj and up_proj, concatenate into [2*inter, hidden] matrix.
-fn load_fused_gate_up(weights: &HashMap<String, RawTensor>, prefix: &str) -> Result<CpuWeight> {
-    let (gw, gs) = load_f32_vec(weights, &format!("{}.gate_proj.weight", prefix))?;
-    let (uw, us) = load_f32_vec(weights, &format!("{}.up_proj.weight", prefix))?;
+/// Load gate_proj and up_proj, concatenate into [2*inter, hidden] f16 matrix.
+fn load_fused_gate_up_f16(weights: &HashMap<String, RawTensor>, prefix: &str) -> Result<CpuWeightF16> {
+    let (gw, gs) = load_f16_vec(weights, &format!("{}.gate_proj.weight", prefix))?;
+    let (uw, us) = load_f16_vec(weights, &format!("{}.up_proj.weight", prefix))?;
     let inter = gs[0]; let hidden = gs[1];
     assert_eq!(us[0], inter); assert_eq!(us[1], hidden);
     let mut fused = Vec::with_capacity(2 * inter * hidden);
     fused.extend_from_slice(&gw);
     fused.extend_from_slice(&uw);
-    Ok(CpuWeight { data: fused, rows: 2 * inter, cols: hidden })
+    Ok(CpuWeightF16 { data: fused, rows: 2 * inter, cols: hidden })
 }
