@@ -11,8 +11,8 @@ cudarc = { version = "0.19", features = ["cublas", "f16", "cuda-version-from-bui
 # gemm + rayon power the CPU-only text-decoder engine (cpu_engine.rs).  We drive them
 # directly so we can force Rayon parallelism on the m=1 GEMVs that typical GEMM thresholds
 # leave single-threaded.
-gemm = { version = "0.18", optional = true }
-rayon = { version = "1.10", optional = true }
+gemm = "0.18"
+rayon = "1.10"
 tokenizers = { version = "0.22", features = ["onig"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -32,7 +32,7 @@ reqwest = { version = "0.12", features = ["blocking"], optional = true }
 # Both backends store weights as f16, compute as f32.
 default = ["cuda"]
 cuda = ["dep:cudarc"]
-cpu = ["dep:gemm", "dep:rayon"]
+cpu = []           # Legacy no-op: CPU inference is always available.
 hub = ["dep:reqwest"]
 
 [dev-dependencies]

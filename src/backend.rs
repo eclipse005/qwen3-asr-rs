@@ -1,53 +1,83 @@
-//! Backend dispatch — minimal `enum` selection between CUDA and CPU engines.
+//! Backend selection — pure tag enum, no internal types.
 //!
-//! `Backend` is a tag + a CUDA handle.  Callers match on it and forward to the
-//! corresponding engine.  The heavy lifting lives in `cudarc_engine` (GPU) and
+//! `Backend` is a lightweight selection tag.  Pass it to [`AsrInference::load`]
+//! to choose CPU or GPU.  The heavy lifting lives in `cudarc_engine` (GPU) and
 //! `cpu_engine` (CPU); this module just owns the dispatch.
 
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 
-#[cfg(feature = "cuda")]
-use crate::cudarc_engine::CudaState;
-
-/// The chosen compute backend.  Construct via [`Backend::best`] unless the
-/// caller wants to force a specific device.
-#[cfg(feature = "cuda")]
+/// Compute backend selection.  Pass to [`crate::AsrInference::load`] to choose.
+///
+/// `Auto` detects the best available backend at load time (prefers CUDA when
+/// the `cuda` feature is enabled and a device is present; falls back to CPU).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
-    Cuda(Arc<CudaState>),
+    /// Detect the best available backend at load time.
+    Auto,
+    /// Force CPU inference.
     Cpu,
+    /// Force CUDA inference (GPU 0).
+    #[cfg(feature = "cuda")]
+    Cuda,
 }
 
-#[cfg(not(feature = "cuda"))]
-pub enum Backend {
+/// Internal resolved backend — carries `Arc<CudaState>` when CUDA is selected.
+/// Never exposed in the public API.
+pub(crate) enum ResolvedBackend {
     Cpu,
+    #[cfg(feature = "cuda")]
+    Cuda(Arc<crate::cudarc_engine::CudaState>),
 }
 
 impl Backend {
-    /// Pick the "best" available backend.  With `cuda` feature, prefers CUDA
-    /// (GPU 0); otherwise falls back to CPU.
-    #[cfg(feature = "cuda")]
-    pub fn best() -> anyhow::Result<Self> {
-        match CudaState::new(0) {
-            Ok(state) => Ok(Backend::Cuda(Arc::new(state))),
-            Err(e) => {
-                log::warn!("CUDA init failed ({}); falling back to CPU", e);
-                Ok(Backend::Cpu)
+    /// Resolve `Auto` to a concrete backend; leave explicit choices unchanged.
+    pub(crate) fn resolve(self) -> anyhow::Result<ResolvedBackend> {
+        match self {
+            Backend::Cpu => Ok(ResolvedBackend::Cpu),
+            #[cfg(feature = "cuda")]
+            Backend::Cuda => {
+                use crate::cudarc_engine::CudaState;
+                let state = CudaState::new(0)?;
+                Ok(ResolvedBackend::Cuda(Arc::new(state)))
+            }
+            Backend::Auto => {
+                #[cfg(feature = "cuda")]
+                {
+                    use crate::cudarc_engine::CudaState;
+                    match CudaState::new(0) {
+                        Ok(state) => {
+                            log::info!("Auto: selected CUDA device 0");
+                            Ok(ResolvedBackend::Cuda(Arc::new(state)))
+                        }
+                        Err(e) => {
+                            log::warn!("Auto: CUDA init failed ({e}); falling back to CPU");
+                            Ok(ResolvedBackend::Cpu)
+                        }
+                    }
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    log::info!("Auto: no GPU backend available, using CPU");
+                    Ok(ResolvedBackend::Cpu)
+                }
             }
         }
     }
 
-    #[cfg(not(feature = "cuda"))]
+    /// Backward-compatible convenience: returns `Backend::Auto`.
     pub fn best() -> anyhow::Result<Self> {
-        Ok(Backend::Cpu)
+        Ok(Backend::Auto)
     }
 
     /// Short human label — useful for logs.
     pub fn tag(&self) -> &'static str {
         match self {
-            #[cfg(feature = "cuda")]
-            Backend::Cuda(_) => "cuda:0",
+            Backend::Auto => "auto",
             Backend::Cpu => "cpu",
+            #[cfg(feature = "cuda")]
+            Backend::Cuda => "cuda:0",
         }
     }
 }

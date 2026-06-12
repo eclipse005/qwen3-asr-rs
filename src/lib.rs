@@ -10,9 +10,7 @@ pub(crate) mod raw_tensor;
 mod cudarc_engine;
 #[cfg(feature = "cuda")]
 mod gpu_audio_encoder;
-#[cfg(feature = "cpu")]
 mod cpu_engine;
-#[cfg(feature = "cpu")]
 mod cpu_audio_encoder;
 
 pub use backend::Backend;
