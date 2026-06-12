@@ -2,7 +2,7 @@
 name = "qwen3-asr"
 version = "0.2.2"
 edition = "2021"
-description = "Local speech-to-text (ASR) in Rust — hand-written CUDA engine (end-to-end) + CPU text decoder"
+description = "Local speech-to-text (ASR) in Rust — hand-written CUDA + CPU inference engines"
 license = "MIT"
 
 [dependencies]
@@ -28,9 +28,8 @@ reqwest = { version = "0.12", features = ["blocking"], optional = true }
 
 [features]
 # Default = cuda: end-to-end transcribe works out of the box on a CUDA-capable host.
-# CPU text decoder is implemented (use --no-default-features --features cpu),
-# but the CPU audio encoder is not yet implemented — transcribe() will fail loudly
-# in that configuration. See ROADMAP.md.
+# CPU path also works end-to-end (--no-default-features --features cpu).
+# Both backends store weights as f16, compute as f32.
 default = ["cuda"]
 cuda = ["dep:cudarc"]
 cpu = ["dep:gemm", "dep:rayon"]

@@ -4,9 +4,7 @@
 
 ## 0. 项目是什么
 
-Qwen3-ASR（0.6B / 1.7B）的 Rust 推理库。在 NVIDIA P104-100（Pascal sm_61）上做过极限优化，单卡 RTFx 在 0.6B 15s 上 ~24×、30s ~21×、90s ~19×。当前唯一能端到端跑通的是 **CUDA 路径**（cuBLAS + NVRTC 手写 kernel）。CPU 路径只实现了**文本解码器**（gemm + rayon），CPU 音频编码器**未实现**——CPU 端 `transcribe()` 在运行时直接报错。
-
-仓库里没有 burn 框架代码——这次重构把它彻底移除了，引擎全是手写的。`burn_cubecl` / `cubecl` / `burn` 都不在依赖里。
+Qwen3-ASR（0.6B / 1.7B）的 Rust 推理库。**双后端**：CUDA（cuBLAS + NVRTC 手写 kernel）和 CPU（gemm + rayon），均端到端可用。权重 f16 存储 + f32 计算，兼顾内存和精度。
 
 ## 1. 当前在哪
 
@@ -14,49 +12,119 @@ Qwen3-ASR（0.6B / 1.7B）的 Rust 推理库。在 NVIDIA P104-100（Pascal sm_6
 
 ```
 src/
-├── backend.rs           # Backend 枚举（Cuda | Cpu）+ best() 调度
-├── config.rs            # AsrConfig serde
-├── error.rs             # AsrError / Result
-├── hub.rs               # (可选) hub 模式下载
-├── mel.rs               # mel spectrogram（CPU, f32）
-├── inference.rs         # AsrInference 装配 + mel→embed→generate 主循环
-├── raw_tensor.rs        # safetensors 原始字节 view（weight loading 用）
-├── cpu_engine.rs        # 手写 CPU 文本解码器（gemm + rayon）
-├── cudarc_engine.rs     # ★ 手写 GPU 文本解码器（cuBLAS + NVRTC kernel）+ DecodeScratch 复用
-├── gpu_audio_encoder.rs # ★ 手写 GPU 音频编码器（cuBLAS + 自定义 conv2d/im2col）
-└── kernels/kernels.cu   # 所有 CUDA kernel（运行时 NVRTC 编译）
-tests/transcribe.rs       # 13 个 #[ignore] 集成测试（0.6B/1.7B × 各种时长）
-scripts/bench.ps1        # 每个 test 独立 `cargo test` 进程跑（避免 cuBLAS/cache 跨测串味）
+├── backend.rs            # Backend 枚举（Cuda | Cpu）+ best() 调度
+├── config.rs             # AsrConfig serde
+├── error.rs              # AsrError / Result
+├── hub.rs                # (可选) hub 模式下载
+├── mel.rs                # mel spectrogram（CPU, f32）
+├── inference.rs          # AsrInference 装配 + mel→embed→generate 主循环
+├── raw_tensor.rs         # safetensors 原始字节 view（weight loading 用）
+├── cpu_audio_encoder.rs  # ★ 手写 CPU 音频编码器（im2col + gemm + rayon + f16 权重）
+├── cpu_engine.rs         # ★ 手写 CPU 文本解码器（gemm + rayon + f16 权重）
+├── cudarc_engine.rs      # ★ 手写 GPU 文本解码器（cuBLAS + NVRTC kernel）+ DecodeScratch 复用
+├── gpu_audio_encoder.rs  # ★ 手写 GPU 音频编码器（cuBLAS + 自定义 conv2d/im2col）
+└── kernels/kernels.cu    # 所有 CUDA kernel（运行时 NVRTC 编译）
+tests/
+├── transcribe.rs          # 13 个 #[ignore] CUDA 集成测试（0.6B/1.7B × 各种时长）
+├── cpu_transcribe.rs      # 7 个 CPU 集成测试（0.6B × 全 fixture）
+├── cpu_90s.rs             # 90s 单独 CPU 测试（独立进程跑，可单独 benchmark）
+└── fixtures/              # 7 个 wav: sample1 / 15s / 30s / 90s / 89s_ja / 180s / 180s_en
 ```
 
 ### 1.2 公共 API
 
-`lib.rs` 只导出 `Backend`、`AsrError` / `Result`、`AsrInference` / `TranscribeOptions` / `TranscribeResult`、`load_audio_wav`。**没有** `StreamingOptions` / `StreamingState` / `best_device()`（这次重构删了 streaming.rs）。
+`lib.rs` 导出 `Backend`、`AsrError` / `Result`、`AsrInference` / `TranscribeOptions` / `TranscribeResult`、`load_audio_wav`。**没有** `StreamingOptions` / `StreamingState` / `best_device()`。
 
 ### 1.3 Features
 
 ```toml
 default = ["cuda"]      # 端到端可用
 cuda = ["dep:cudarc"]
-cpu  = ["dep:gemm", "dep:rayon"]  # 只文本；transcribe 跑不通
+cpu  = ["dep:gemm", "dep:rayon"]  # 端到端可用（f16 权重 + f32 计算）
 hub  = ["dep:reqwest"]
 ```
 
-### 1.4 性能（基准线，0.6B 模型，P104-100）
+### 1.4 性能（基准线，P104-100）
+
+#### CPU 0.6B（Ryzen/Intel，f16 权重存储）
+
+| 音频 | RTFx | 耗时 |
+|---|---|---|
+| 15s 英文 | 4.16× | 3.6s |
+| 30s 中文 | 3.72× | 8.1s |
+| 90s 英文 | 3.87× | 23.2s |
+| 89s 日文 | 4.22× | 21.1s |
+| 180s 中文 | 4.18× | 43.0s |
+| 180s 英文 | 4.15× | 43.3s |
+
+#### CUDA 0.6B（P104-100，Pascal sm_61）
 
 | 音频 | RTFx |
 |---|---|
-| 15s 英文 | ~24× |
-| 30s 中文 | ~21× |
-| 90s 英文 | ~19× |
-| 180s 英文 | ~17× |
-| 1.7B-15s | ~11× |
+| 15s 英文 | 24.23× |
+| 30s 中文 | 16.00× |
+| 90s 英文 | 16.48× |
+| 89s 日文 | 17.51× |
+| 180s 中文 | 14.20× |
+| 180s 英文 | 15.19× |
 
-数字来源：`tests/transcribe.rs`（必须 `--features cuda` + `--ignored --nocapture --test-threads=1`）。
+#### CUDA 1.7B（P104-100）
+
+| 音频 | RTFx |
+|---|---|
+| 15s 英文 | 8.93× |
+| 30s 中文 | 7.74× |
+| 90s 英文 | 8.56× |
+| 89s 日文 | 9.74× |
+| 180s 中文 | 7.94× |
+| 180s 英文 | 8.45× |
+
+数字来源：
+- CUDA: `cargo test --release --test transcribe -- --ignored --nocapture --test-threads=1`
+- CPU: `cargo test --release --no-default-features --features cpu --test cpu_transcribe -- --nocapture --test-threads=1`
+
+### 1.5 内存
+
+90s 音频 0.6B CPU 峰值工作集约 **3,482 MB**（f16 权重），比纯 f32 的 4,657 MB 节省 ~25%。
 
 ## 2. 关键架构事实
 
-### 2.1 GPU 解码器的主路径（`inference.rs::generate_cuda`）
+### 2.1 权重存储：f16 + f32 计算
+
+两个后端统一模式：
+- **存储**：`CpuWeightF16 { data: Vec<half::f16>, rows, cols }`（音频编码器 + 文本解码器共用类型名，分别定义在各自的文件里）
+- **CPU 解码** (m=1)：`linear_gemv_f16` 直接读 f16 权重，寄存器内转 f32 累加 → 省一半内存带宽，比 f32 GEMV 快 5-9%
+- **CPU prefill** (m>1)：rayon `par_iter` 批量 f16→f32 转换后走 gemm crate 的 f32 GEMM
+- **CPU 音频编码器**：顺序 f16→f32 转换（权重小，~100 次/forward，rayon 反而慢）
+- **GPU**：cuBLAS f16 GEMM 直接消费 f16 权重
+
+### 2.2 CPU 音频编码器（`cpu_audio_encoder.rs`）
+
+```
+ConvStem: 3× conv2d (im2col + gemm) + GELU + permute + positional encoding
+18× CpuAudioLayer:
+  LayerNorm → windowed self-attention (scalar + rayon across heads) → residual
+  LayerNorm → FFN (gate + up + SiLU + down) → residual
+```
+
+- im2col 生成列矩阵后 gemm 做卷积
+- Attention: 标量循环 + rayon 跨 (batch, head) 对并行（GEMM per-head 在小窗口上反而慢）
+- f16 权重在 `CpuAudioLinear::forward` 和 `conv_block` 里转 f32 后计算
+
+### 2.3 CPU 文本解码器（`cpu_engine.rs`）
+
+```
+28 层 decoder，每层:
+  RMSNorm → QKV fused linear → MRoPE → windowed attention → O-proj → residual
+  RMSNorm → gate_up fused linear → SiLU → down → residual
++ final RMSNorm → embed_table linear → argmax
+```
+
+- decode (m=1): `linear_gemv_f16` 直接读 f16，寄存器内转 f32
+- prefill (m>1): rayon 批量 f16→f32，然后 gemm crate f32 GEMM
+- `linear_accum_f16`: 带 residual 累加的线性层（cuBLAS beta=1 思路的 CPU 版）
+
+### 2.4 GPU 解码器主路径（`inference.rs::generate_cuda`）
 
 ```
 prefill（一次）：
@@ -64,9 +132,9 @@ prefill（一次）：
   cos/sin MRoPE 表预计算（CPU）+ upload
   GpuKvCache 预分配
   decoder.forward(hs, cos, sin, kv, 0, true, true)  → logits [1, 1, vocab]
-  argmax → token_buf[0]   # 第一次用
+  argmax → token_buf[0]
 decode loop（每步）：
-  embed_id_from_gpu_slot_into(embed_table, token_buf, 0, h_buf)  # 不 htod
+  embed_id_from_gpu_slot_into(embed_table, token_buf, 0, h_buf)
   forward_decode_scratch(h_buf, cos, sin, kv, current_pos, token_buf, scratch)
     = 28 layers × (rms_norm + linear QKV + qkv_extract + attn + O + rms + gate_up + silu + down)
     + final_norm + linear(embed_table) + argmax
@@ -78,113 +146,115 @@ decode loop（每步）：
 - KV cache 一次性预分配到 `total_positions = seq_len + max_new_tokens`，decode 步不重新分配
 - scratch buffer（`DecodeScratch`）也一次性预分配，decode 步 alloc 数为 0
 - `token_buf[0]` 是唯一跨步传递的 i32，不做 htod
-- 注意：decode 步 28×1 步用 `fused_gqa_decode_split`（chunk=256 或 512），prefill 走 `fused_gqa_decode_split`（当 cur_len>1024）否则走非 split——两边在数学上等价
+- decode 步 28×1 步用 `fused_gqa_decode_split`（chunk=256 或 512），prefill 走 `fused_gqa_decode_split`（当 cur_len>1024）否则走非 split
 
-### 2.2 优化历史（看代码看到满地黑科技时参考）
+### 2.5 GPU 优化历史
 
-数字从旧 HANDOFF 摘来，对应 0.6B 模型 15s 英文 cold-start RTFx。**前 8 步在父仓库里做**（本仓 `250ca4d` 是 extract commit），本仓只看到后面 4 步的 commit。历史脉络（从低到高）：
+数字对应 0.6B 15s 英文 cold-start RTFx，从低到高：
+
 1. baseline burn-cubecl → 0.25x
 2. 手写 GpuTensor + cuBLAS：0.55x
 3. NVRTC element-wise + GPU KV cache：1.4x
 4. GPU conv stem（im2col + cuBLAS）：6.4x
-5. fused_gqa_decode 融合（Q·K + softmax + ·V 一次 launch）：7.6x
-6. fused QKV extract + RMSNorm + rotary + cache 写一次：9.8x
-7. linear_gpu_accum（cuBLAS beta=1 省残差 launch）：10.6x
-8. fused_gqa_decode_split（flash-attn 2-kernel，跨 block 并行）：12.5x
-9. **alloc_uninit_f16（Pascal driver enqueue 限速 → memset 占 80% 的 launch time）**：23× — **最大的单步收益** ← 仓内 commit `6251120`
-10. skip clone_tensor at O-proj：23.5× ← 仓内 `50d2524`
-11. GPU-resident next-token（argmax_into_slot + embed_lookup_single_i32）：23.7× ← 仓内 `4675c74`
-12. fused QKV extract kernel：24× ← 仓内 `f1df993`
-
-**未完成 / 失败 / 不可行**：
-- **CUDA Graph 捕获 decode 步** — 已删（详见 §3.1）。P104 是 sm_61，CUDA Graph 需要 sm_70+。
-- **lm_head GEMV + argmax 融合** — kernel 存在（`lm_head_gemv_argmax_f16`）但注释里说"目前输给 cuBLAS"，未用。
-- **conv stem permute 走 GPU** — `gpu_audio_encoder.rs::GpuConvStem::forward` 末尾还有一段 download→CPU permute→upload，是已知遗留。
+5. fused_gqa_decode 融合：7.6x
+6. fused QKV extract + RMSNorm + rotary + cache 写：9.8x
+7. linear_gpu_accum（cuBLAS beta=1）：10.6x
+8. fused_gqa_decode_split（flash-attn 2-kernel）：12.5x
+9. **alloc_uninit_f16（Pascal driver enqueue 限速 → memset 占 80% launch time）**：23× — 最大单步收益 ← `6251120`
+10. skip clone_tensor at O-proj：23.5× ← `50d2524`
+11. GPU-resident next-token：23.7× ← `4675c74`
+12. fused QKV extract kernel：24× ← `f1df993`
 
 ## 3. 卡点 / 已知问题
 
-### 3.1 [已删] CUDA Graph 死代码
+### 3.1 [已删] CUDA Graph — 硬件不支持（sm_61），代码已清理
 
-重构前留了一段 `DecodeGraph`（~140 行）+ `set_cublas_workspace`（~40 行），注释说"capture 返回 STREAM_CAPTURE_UNSUPPORTED"。整个推理路径不用。**已经删除**。如果你看到类似东西进来，删掉并更新 ROADMAP。
+### 3.2 Conv stem 走 CPU detour
 
-### 3.2 CPU 路径不完整
+`gpu_audio_encoder.rs::GpuConvStem::forward` 末尾：GPU→CPU download→permute `[b,c,f,t]→[b,t,c,f]`→重新 upload。**单次推理 ~5-10ms**。修法：写一个 4D permute kernel 替换。
 
-`encode_audio_cpu` 直接返回 Err，CPU 端只能跑文本解码器。如果有人想跑 `--no-default-features --features cpu`，需要先实现 CPU 音频编码器（建议参考 `gpu_audio_encoder.rs` 的 GpuConvStem + transformer，照搬手写 matmul + LayerNorm + windowed attention）。
+### 3.3 已知 dead code（rustc 警告）
 
-### 3.3 Conv stem 走 CPU detour
+- `gpu_audio_encoder.rs::GpuAudioEncoder::run_transformer` — 保留，未来 streaming 入口
+- `inference.rs::AsrInferenceInner::tokenizer_decode` — 保留，debug/streaming 复用
+- `inference.rs::AsrInferenceInner::decode_result` — **不是 dead code**，rustc 误报
+- `raw_tensor.rs::to_f32_vec` / `as_f32` — CPU 路径改用 `as_f16()`，GPU 不用 f32，但保留作为工具方法
 
-`gpu_audio_encoder.rs::GpuConvStem::forward` 第 252-264 行：从 GPU 下载 3-conv 后的 tensor，按 `[b, c, f, t] → [b, t, c, f]` permute，重新上传。**单次推理总成本里 ~5-10ms**。修法：写一个 4D permute kernel 替换这段。
+### 3.4 streaming API
 
-### 3.4 已知 dead code（rustc 警告）
+旧的 `StreamingState` 已删。需要重新设计 chunked 音频 → 文本解码器的 prefix + overlap 策略。
 
-- `gpu_audio_encoder.rs::GpuAudioEncoder::run_transformer` — 无人调用，原本注释"legacy path，burn conv stem 上游用的"已过时（burn 删了）。**保留**：未来 streaming 重做时可能用，标注是 "caller uploads conv_out 跳过 conv stem" 的入口。
-- `inference.rs::AsrInferenceInner::tokenizer_decode` — 未用，**保留**：可能在 streaming 或 debug API 里复用。
-- `inference.rs::AsrInferenceInner::decode_result` — **不是 dead code**，被 `run_inference` 调（line 178）。rustc 误报可以 ignore。
+### 3.5 测试 fixture
 
-### 3.5 streaming.rs 整个删了
+7 个 wav 文件在 `tests/fixtures/`。无自动下载脚本。
 
-旧的 `StreamingState` 公共 API 没了。如果用户提"流式转写"需求，需要：
-1. 在 `gpu_audio_encoder.rs` 复用 conv stem 一次性算全 mel
-2. chunked 喂给文本解码器（音频 embeds 按窗口切）
-3. 设计 prefix + overlap 拼接策略
+### 3.6 lm_head GEMV + argmax 融合
 
-### 3.6 测试 fixture 缺失
+kernel 存在（`lm_head_gemv_argmax_f16`）但注释说"目前输给 cuBLAS"，未用。值得重测。
 
-`tests/fixtures/` 目录存在但具体 wav 文件状态未知。运行测试前先 `ls tests/fixtures/`，缺什么就 huggingface 找或自己录。**没有**对应的 fixture 自动下载脚本。
+## 4. 已完成
 
-## 4. 下一步规划（按优先级）
+- [x] CPU 音频编码器：conv stem + 18 层 transformer（im2col + gemm + rayon）
+- [x] CPU 文本解码器：28 层 decoder（gemm + rayon）
+- [x] CPU 端到端 transcribe 全部 fixture 通过
+- [x] f16 权重存储（音频编码器 + 文本解码器），内存节省 ~25%
+- [x] GPU 全部 13 个集成测试通过
+- [x] CUDA Graph 死代码清理
+- [x] 脱离 burn 框架
 
-### 4.1 P0：稳定 + 验证
+## 5. 下一步规划
 
-- [ ] **跑一遍 `cargo check --features cuda`** 确认重构后编译通过（rustc 已经报了 dead-code 警告，已知 §3.4）
-- [ ] **跑 13 个集成测试**（`cargo test --release --features cuda --test transcribe -- --ignored --nocapture --test-threads=1`），逐个确认 RTFx 数字没有回退
-- [ ] 写一个最小 smoke test：输入 5s wav，断言输出非空、语言识别对——纳入 CI
+### 5.1 P1：CUDA 小优化（明确收益）
 
-### 4.2 P1：小优化（风险低、明确收益）
+- [ ] **Conv stem GPU permute kernel**（§3.2）— 消除 CPU detour ~5-10ms
+- [ ] **lm_head 融合重测**（§3.6）— 可能已比纯 cuBLAS 快
+- [ ] dead code warning 清理（`#[allow(dead_code)]` 或删）
 
-- [ ] **修 conv stem permute kernel**（§3.3）— 写 `permute_bctf_to_btcf_f16` kernel，替换 252-264 行
-- [ ] **lm_head 融合用回** — 重测 `lm_head_gemv_argmax_f16` 在当前硬件下是否还输 cuBLAS，可能更新了
-- [ ] **删 run_transformer + tokenizer_decode** 如果确定未来用不到（§3.4）— 但用户没要求，先观察
-- [ ] 减 warning：把 `#[allow(dead_code)]` 加到 §3.4 里的两个保留 API 上，干净
+### 5.2 P2：CPU 优化
 
-### 4.3 P2：跨平台
+- [ ] **AVX2 手写 GEMV** — 当前 decode 用标量循环读 f16→f32 累加，SIMD 可加速 2-4×
+- [ ] **im2col SIMD** — 卷积 im2col 生成目前是标量赋值
+- [ ] **注意力微优化** — 目前标量 + rayon 跨 head，可尝试分块矩阵乘
+- [ ] 更激进的 rayon 策略（跨层并行？prefill 阶段流水线？）
 
-- [ ] **CPU 音频编码器**（§3.2）— 这是大工程。先做最小可用版：纯 f32 跑通正确性，再考虑 rayon 并行 / 手写 GEMV
-- [ ] **去掉 `Backend::Cpu` 这条死路或完成它** — 现在 CPU 既不能 transcribe 又会给人错觉。两条路：
-  - 删 cpu feature（推荐，等真做出来了再加）
-  - 或者在 `encode_audio_cpu` 改成"feature detected"——只 `cfg(feature = "cpu")` 才编译，主张"cpu 路径不接受 transcribe，只跑纯文本 forward"
-- [ ] streaming API 重建（§3.5）
+### 5.3 P3：功能
 
-### 4.4 P3：真正的提速
+- [ ] streaming API 重建（§3.4）
+- [ ] fixture 自动下载脚本（§3.5）
 
-- [ ] **PinnedHostSlice 异步 argmax**（`cudaStreamAddCallback`）省 50µs/step
-- [ ] **kv cache 预 fetch**：prefill 后第一个 decode 步不等 cuBLAS
-- [ ] **1.7B 完整 benchmark**（10s/15s/30s/90s/180s 全跑）
-- [ ] 看 cuBLASLt 替换 cudarc::cublas（f16 GEMM 在 Pascal 上有 ~10% 提升空间）
+### 5.4 P4：CUDA 极限
 
-### 4.5 不做
+- [ ] PinnedHostSlice 异步 argmax（`cudaStreamAddCallback`，省 ~50µs/step）
+- [ ] KV cache 预 fetch（prefill 后第一个 decode 步不等 cuBLAS）
+- [ ] cuBLASLt 替换（Pascal f16 GEMM ~10% 提升空间）
 
-- **CUDA Graph** — 硬件不支持
-- **ROCm / Metal / Vulkan 路径** — 上一任已经决定不做（cudarc 专属），明确放弃
-- **把架构改回多后端**（burn 框架）— 这次重构的目的就是脱离 burn
+### 5.5 不做
 
-## 5. 给接手 AI 的具体操作
-
-```
-1. 读 §0-§2（本文件）
-2. cargo check --features cuda  — 看新警告
-3. cargo test --release --features cuda --test transcribe -- --ignored --nocapture --test-threads=1 test_q06_15s
-   — 验证主路径不退化
-4. 想要新优化前先看 §3 卡点，别重蹈覆辙
-5. 改完跑 §4.1 三个验证步骤
-```
+- **CUDA Graph** — sm_61 不支持
+- **ROCm / Metal / Vulkan** — 已明确放弃，cudarc 专属
+- **回到 burn 框架** — 这次重构的目的就是脱离它
 
 ## 6. 一些不能忘的事实
 
-- **NVRTC 编译时需要 CUDA_PATH**（Windows 通常 `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.x`，Linux 通常 `/usr/local/cuda`）
-- **cudarc 0.19**（不是 0.17），`cuda-12080` 特性
-- **`__launch_bounds__` 在所有 kernel 上**（Pascal sm_61 register pressure 优化，重写时记得加）
+- **NVRTC 编译需要 CUDA_PATH**（Windows: `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.x`）
+- **cudarc 0.19**（`cuda-12080` feature）
+- **`__launch_bounds__` 在所有 kernel 上**（Pascal sm_61 register pressure 优化）
 - **f16 + f32 累加**是统一模式，不要降级
-- **Pascal driver 有 enqueue 限速**（alloc_zeros → memset 触发），这正是 alloc_uninit 收益巨大的原因
-- **测试多线程跑会抢 GPU**——必须 `--test-threads=1`
-- **`h_buf` 跨步复用**：decode 步 28 层都改 `h` in-place，最后 `forward_decode_scratch` 里的 final_norm 是 read-only 写到 `scratch.final_norm`，**不修改 h**——下个 iter 的 `embed_id_from_gpu_slot_into` 才覆盖它。这点别重构坏
+- **Pascal driver 有 enqueue 限速**（alloc_zeros → memset 触发），alloc_uninit 收益巨大
+- **测试多线程跑会抢 GPU** — 必须 `--test-threads=1`
+- **`h_buf` 跨步复用**：decode 步 28 层改 `h` in-place，final_norm 写到 `scratch.final_norm`，不修改 `h`
+- **CPU 音频编码器**：attention 用标量循环 + rayon 跨 head 并行，不要换 GEMM per-head（小窗口 overhead 更大）
+- **CPU f16→f32 转换**：音频编码器顺序转（100+ 次小权重，rayon 开销大于收益）；文本解码器 prefill 用 rayon 转（大权重 ~1.2GB，rayon 明显更快）
+- **`half` crate v2** 是无条件依赖（不是 optional），GPU 和 CPU 路径都用
+
+## 7. 给接手 AI 的具体操作
+
+```
+1. 读 §0-§2（本文件）
+2. 确认想改的方向（CPU / CUDA），看 §5 对应优先级
+3. 改前跑对应基线：
+   CUDA: cargo test --release --test transcribe -- --ignored --nocapture --test-threads=1 test_q06_15s
+   CPU:  cargo test --release --no-default-features --features cpu --test cpu_transcribe -- --nocapture --test-threads=1 test_cpu_15s
+4. 改完跑全量测试验证不退化
+5. 更新 ROADMAP 里的 RTFx 数字
+```
