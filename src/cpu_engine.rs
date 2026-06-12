@@ -692,8 +692,12 @@ impl CpuTextDecoder {
         let sl = hs.shape[1];
         let mut h = hs;
         let t_layers = std::time::Instant::now();
+        // Per-layer timing — emit only on sample step 100 of decode (s=1).
+        let mut layer_ms = [0f64; 28];
         for (i, layer) in self.layers.iter().enumerate() {
+            let t = std::time::Instant::now();
             h = layer.forward(h, cos_table, sin_table, kv, i, kv_start, use_causal);
+            layer_ms[i] = t.elapsed().as_secs_f64() * 1000.0;
         }
         let layers_ms = t_layers.elapsed().as_secs_f64() * 1000.0;
         kv.cur_len = kv_start + sl;
@@ -719,10 +723,14 @@ impl CpuTextDecoder {
         let logits = CpuTensor::new(logits_vec, vec![1, 1, vocab]);
         let post_ms = t_post.elapsed().as_secs_f64() * 1000.0;
         if sl == 1 {
-            // Only emit once per 100 decode steps so the log doesn't drown the output.
-            // Approximate detection: use kv_start as a proxy (kv_start grows by 1 per decode).
-            if kv_start % 50 == 49 {
-                log::info!("step kv_start={}: layers={:.2}ms final+lm={:.2}ms", kv_start, layers_ms, post_ms);
+            if kv_start % 100 == 99 {
+                let mut s = format!("step kv_start={}: layers={:.2}ms final+lm={:.2}ms | per layer: ",
+                                    kv_start, layers_ms, post_ms);
+                for (i, &ms) in layer_ms.iter().enumerate() {
+                    if i > 0 { s.push_str(", "); }
+                    s.push_str(&format!("{}:{:.2}", i, ms));
+                }
+                log::info!("{}", s);
             }
         }
         logits
