@@ -401,10 +401,44 @@ impl GpuAudioEncoder {
         Ok(out_f16.iter().map(|&v| f32::from(v)).collect())
     }
 
+    /// Run conv-stem on a single mel chunk of exactly `cs` frames (f16 output).
+    /// mel_chunk: [n_mels * cs] flat f32 (mel-bin-major).
+    /// Returns [tpc * d_model] f16 tokens where tpc = feo(cs).
+    pub fn run_conv_stem_single(
+        &self, mel_chunk: &[f32], n_mels: usize, cs: usize,
+    ) -> Result<Vec<f16>> {
+        use half::f16;
+        let f16_chunk: Vec<f16> = mel_chunk.iter().map(|&v| f16::from_f32(v)).collect();
+        let (conv_data, _t2) = self.conv_stem.forward(&self.cuda, &f16_chunk, 1, n_mels, cs)?;
+        let cpu = self.cuda.download_tensor(&conv_data)?;
+        Ok(cpu.data)
+    }
+
+    /// Run conv-stem on a partial (tail) mel chunk, zero-padded to `cs` frames.
+    /// Returns [feo(actual_frames) * d_model] f16 tokens.
+    pub fn run_conv_stem_tail(
+        &self, mel_chunk: &[f32], n_mels: usize, actual_frames: usize, cs: usize,
+    ) -> Result<Vec<f16>> {
+        use half::f16;
+        let tpc = feo(actual_frames);
+        // Zero-pad to cs frames.
+        let mut padded = vec![0.0f32; n_mels * cs];
+        for m in 0..n_mels {
+            let dst_base = m * cs;
+            let src_base = m * actual_frames;
+            for j in 0..actual_frames {
+                padded[dst_base + j] = mel_chunk[src_base + j];
+            }
+        }
+        let f16_chunk: Vec<f16> = padded.iter().map(|&v| f16::from_f32(v)).collect();
+        let (conv_data, _t2) = self.conv_stem.forward(&self.cuda, &f16_chunk, 1, n_mels, cs)?;
+        let cpu = self.cuda.download_tensor(&conv_data)?;
+        let dm = self.config.d_model;
+        Ok(cpu.data[..tpc * dm].to_vec())
+    }
+
     /// Run the transformer stack on pre-computed conv output [n_tokens, d_model].
     /// Skips the conv stem; caller uploads the [n_tokens, d_model] tensor.
-    /// Currently unused — kept for future streaming work (see ROADMAP.md §3.5).
-    #[allow(dead_code)]
     pub fn run_transformer(&self, conv_out: &[f16], n_tokens: usize) -> Result<(Vec<f16>, usize)> {
         let dm = self.config.d_model;
         let cs = self.config.n_window * 2;
@@ -428,9 +462,14 @@ impl GpuAudioEncoder {
         let out_dim = out.shape[out.shape.len() - 1];
         Ok((out.data, out_dim))
     }
+
+    /// Access config for streaming chunking parameters.
+    pub fn config(&self) -> &AudioEncoderConfig {
+        &self.config
+    }
 }
 
-fn feo(ifr: usize) -> usize {
+pub(crate) fn feo(ifr: usize) -> usize {
     let f = |l: usize| -> usize { (l - 1) / 2 + 1 };
     f(f(f(ifr)))
 }

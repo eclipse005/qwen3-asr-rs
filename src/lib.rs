@@ -8,6 +8,7 @@ mod mel;
 pub(crate) mod raw_tensor;
 mod mrope;
 mod prompt;
+mod streaming;
 mod weights;
 #[cfg(feature = "cuda")]
 mod cudarc_engine;
@@ -20,3 +21,4 @@ pub use backend::Backend;
 pub use error::{AsrError, Result};
 pub use inference::{AsrInference, TranscribeOptions, TranscribeResult, StreamToken};
 pub use mel::load_audio_wav;
+pub use streaming::AsrStreamingSession;

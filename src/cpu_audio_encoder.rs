@@ -532,7 +532,7 @@ impl CpuAudioLayer {
 }
 
 /// Replicate of `gpu_audio_encoder.rs::feo` (line 389-392).
-fn feo(ifr: usize) -> usize {
+pub(crate) fn feo(ifr: usize) -> usize {
     let f = |l: usize| -> usize { (l - 1) / 2 + 1 };
     f(f(f(ifr)))
 }
@@ -628,5 +628,64 @@ impl CpuAudioEncoder {
         gelu_inplace(&mut h);
         let h = self.proj2.forward(&h)?;
         Ok(h.data)
+    }
+
+    /// Run conv-stem on a single mel chunk of exactly `cs` frames.
+    /// mel_chunk: [n_mels * cs] flat (mel-bin-major). cs must equal n_window * 2.
+    /// Returns [tpc, d_model] tokens where tpc = feo(cs).
+    pub(crate) fn run_conv_stem(
+        &self, mel_chunk: &[f32], n_mels: usize, cs: usize,
+    ) -> Result<Vec<f32>> {
+        let (conv_data, _t2) = self.conv_stem.forward(mel_chunk, 1, n_mels, cs)?;
+        // conv_data is [t2, d_model] — all tokens are valid for a full chunk.
+        Ok(conv_data)
+    }
+
+    /// Run conv-stem on a partial (tail) mel chunk, zero-padded to `cs` frames.
+    /// mel_chunk: [n_mels * actual_frames] flat. actual_frames < cs.
+    /// Returns [feo(actual_frames), d_model] tokens.
+    pub(crate) fn run_conv_stem_tail(
+        &self, mel_chunk: &[f32], n_mels: usize, actual_frames: usize, cs: usize,
+    ) -> Result<Vec<f32>> {
+        let tpc = feo(actual_frames);
+        // Zero-pad to cs frames.
+        let mut padded = vec![0.0f32; n_mels * cs];
+        for m in 0..n_mels {
+            let dst_base = m * cs;
+            let src_base = m * actual_frames;
+            for j in 0..actual_frames {
+                padded[dst_base + j] = mel_chunk[src_base + j];
+            }
+        }
+        let (conv_data, _t2) = self.conv_stem.forward(&padded, 1, n_mels, cs)?;
+        // Keep only tpc tokens (discard zero-padded extras).
+        let dm = self.config.d_model;
+        Ok(conv_data[..tpc * dm].to_vec())
+    }
+
+    /// Run transformer layers + final projection on packed tokens.
+    /// tokens: [n_tokens, d_model] flat. Returns [n_tokens, output_dim] flat.
+    pub(crate) fn run_transformer(&self, tokens: &[f32], n_tokens: usize) -> Result<Vec<f32>> {
+        let dm = self.config.d_model;
+        let cs2 = self.config.n_window * 2;
+        let tpc2 = feo(cs2);
+        let cpw = self.config.n_window_infer / cs2;
+        let ws = tpc2 * cpw;
+
+        let mut h = CpuTensor::new(tokens.to_vec(), vec![1, n_tokens, dm]);
+        for layer in &self.layers {
+            h = layer.forward(h, Some(ws))?;
+        }
+        // Final projections.
+        let h = self.ln_post.forward(&h);
+        let mut h = self.proj1.forward(&h)?;
+        gelu_inplace(&mut h);
+        let h = self.proj2.forward(&h)?;
+        Ok(h.data)
+    }
+
+    /// Access config for streaming chunking parameters.
+    pub(crate) fn config(&self) -> &AudioEncoderConfig {
+        &self.config
     }
 }

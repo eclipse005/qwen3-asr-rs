@@ -56,7 +56,7 @@ pub struct StreamToken {
 
 // ── Engine enum ───────────────────────────────────────────────────
 
-enum Engine {
+pub(crate) enum Engine {
     Cpu {
         decoder: CpuTextDecoder,
         audio_encoder: CpuAudioEncoder,
@@ -70,10 +70,10 @@ enum Engine {
 }
 
 pub(crate) struct AsrInferenceInner {
-    engine: Engine,
-    mel_extractor: MelExtractor,
-    tokenizer: tokenizers::Tokenizer,
-    config: AsrConfig,
+    pub(crate) engine: Engine,
+    pub(crate) mel_extractor: MelExtractor,
+    pub(crate) tokenizer: tokenizers::Tokenizer,
+    pub(crate) config: AsrConfig,
 }
 
 unsafe impl Send for AsrInferenceInner {}
@@ -203,6 +203,16 @@ impl AsrInference {
         let inner = self.inner.lock().map_err(|_| AsrError::Inference(anyhow::anyhow!("mutex poisoned")))?;
         inner.run_inference_streaming(samples, &options, &mut on_token).map_err(AsrError::Inference)
     }
+
+    /// Create a streaming session that accepts audio incrementally.
+    /// Audio is encoded chunk-by-chunk during `push_samples()`.
+    /// Call `flush()` or `flush_streaming()` to finalize and get text.
+    pub fn create_streaming_session(
+        &self, options: TranscribeOptions,
+    ) -> crate::Result<crate::streaming::AsrStreamingSession<'_>> {
+        let inner = self.inner.lock().map_err(|_| AsrError::Inference(anyhow::anyhow!("mutex poisoned")))?;
+        Ok(crate::streaming::AsrStreamingSession::new(inner, options))
+    }
 }
 
 // ── Internal dispatch ─────────────────────────────────────────────
@@ -269,7 +279,7 @@ impl AsrInferenceInner {
     }
 
     /// Core generate with per-token callback. Used by both streaming and non-streaming paths.
-    fn generate_with_callback(
+    pub(crate) fn generate_with_callback(
         &self, audio_embeds: &[f32], language: Option<&str>,
         prefix_text: Option<&str>, max_new_tokens: usize,
         on_token: &mut dyn FnMut(u32),
