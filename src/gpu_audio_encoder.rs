@@ -358,6 +358,48 @@ impl GpuAudioEncoder {
         Ok((out.data, out_dim))
     }
 
+    /// End-to-end: raw mel spectrogram → chunked f16 → conv stem + transformer → f32 output.
+    /// Handles mel chunking, zero-padding, and f32↔f16 conversion internally.
+    pub fn encode_from_mel(
+        &self, mel_data: &[f32], n_mels: usize, n_frames: usize, n_window: usize,
+    ) -> Result<Vec<f32>> {
+        use half::f16;
+
+        let cs = n_window * 2;
+        let tpc = feo(cs);
+        let nfull = n_frames / cs;
+        let tail = n_frames % cs;
+        let n_chunks = nfull + if tail > 0 { 1 } else { 0 };
+
+        let mut chunked = vec![f16::ZERO; n_chunks * n_mels * cs];
+        let mut chunk_tokens: Vec<usize> = Vec::with_capacity(n_chunks);
+        for i in 0..nfull {
+            let s = i * cs;
+            for m in 0..n_mels {
+                let dst_base = (i * n_mels + m) * cs;
+                let src_base = m * n_frames + s;
+                for j in 0..cs {
+                    chunked[dst_base + j] = f16::from_f32(mel_data[src_base + j]);
+                }
+            }
+            chunk_tokens.push(tpc);
+        }
+        if tail > 0 {
+            let s = nfull * cs;
+            for m in 0..n_mels {
+                let dst_base = (nfull * n_mels + m) * cs;
+                let src_base = m * n_frames + s;
+                for j in 0..tail {
+                    chunked[dst_base + j] = f16::from_f32(mel_data[src_base + j]);
+                }
+            }
+            chunk_tokens.push(feo(tail));
+        }
+
+        let (out_f16, _out_dim) = self.run(&chunked, n_chunks, n_mels, cs, &chunk_tokens)?;
+        Ok(out_f16.iter().map(|&v| f32::from(v)).collect())
+    }
+
     /// Run the transformer stack on pre-computed conv output [n_tokens, d_model].
     /// Skips the conv stem; caller uploads the [n_tokens, d_model] tensor.
     /// Currently unused — kept for future streaming work (see ROADMAP.md §3.5).

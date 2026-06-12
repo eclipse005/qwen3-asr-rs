@@ -9,8 +9,9 @@ use crate::config::AsrConfig;
 use crate::cpu_engine::CpuTextDecoder;
 use crate::cpu_audio_encoder::CpuAudioEncoder;
 use crate::error::AsrError;
-use crate::mel::{load_audio_wav, MelExtractor};
+use crate::mel::{load_audio_wav, MelExtractor, MEL_SAMPLE_RATE, N_FFT, HOP_LENGTH};
 use crate::raw_tensor::RawTensor;
+use crate::prompt;
 
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
@@ -20,19 +21,7 @@ use crate::cudarc_engine::{GpuTextDecoder, GpuKvCache, CudaState,
 #[cfg(feature = "cuda")]
 use crate::gpu_audio_encoder::GpuAudioEncoder;
 
-pub(crate) const IM_END_TOKEN_ID: i64 = 151645;
-pub(crate) const ENDOFTEXT_TOKEN_ID: i64 = 151643;
-pub(crate) const ASR_TEXT_SEP_TOKEN_ID: u32 = 151704;
-pub(crate) const MEL_SAMPLE_RATE: u32 = 16000;
-const N_FFT: usize = 400;
-const HOP_LENGTH: usize = 160;
-
-pub(crate) const TOK_IM_START: i64 = 151644;
-pub(crate) const TOK_SYSTEM: i64 = 8948;
-pub(crate) const TOK_NEWLINE: i64 = 198;
-pub(crate) const TOK_IM_END: i64 = IM_END_TOKEN_ID;
-pub(crate) const TOK_USER: i64 = 872;
-pub(crate) const TOK_ASSISTANT: i64 = 77091;
+// ── Public API types ──────────────────────────────────────────────
 
 #[non_exhaustive]
 pub struct TranscribeOptions {
@@ -56,9 +45,8 @@ pub struct TranscribeResult {
     pub raw_output: String,
 }
 
-// ── Engine enum ──────────────────────────────────────────────────
+// ── Engine enum ───────────────────────────────────────────────────
 
-/// Unified engine — owns the decoder + audio encoder for one backend.
 enum Engine {
     Cpu {
         decoder: CpuTextDecoder,
@@ -86,14 +74,13 @@ pub struct AsrInference {
 }
 
 impl AsrInference {
-    /// Load a model from a local directory and dispatch to the chosen backend.
     pub fn load(model_dir: &Path, backend: Backend) -> crate::Result<Self> {
         info!("Loading config...");
         let config = AsrConfig::from_file(&model_dir.join("config.json"))
             .context("load config").map_err(AsrError::ModelLoad)?;
 
         info!("Loading weights...");
-        let weight_data = load_weights(model_dir)
+        let weight_data = crate::weights::load_weights(model_dir)
             .context("load weights").map_err(AsrError::ModelLoad)?;
         info!("Loaded {} weight tensors", weight_data.len());
 
@@ -106,7 +93,6 @@ impl AsrInference {
         Self::build_engine(config, weight_data, tokenizer, backend).map_err(AsrError::ModelLoad)
     }
 
-    /// Convenience: pick the best available backend automatically.
     pub fn new(model_dir: &Path) -> crate::Result<Self> {
         Self::load(model_dir, Backend::Auto)
     }
@@ -120,8 +106,15 @@ impl AsrInference {
         Self::load(&model_dir, backend)
     }
 
-    fn build_engine(config: AsrConfig, weights: HashMap<String, RawTensor>, tokenizer: tokenizers::Tokenizer, backend: Backend) -> anyhow::Result<Self> {
-        let mel_extractor = MelExtractor::new(N_FFT, HOP_LENGTH, config.thinker_config.audio_config.num_mel_bins, MEL_SAMPLE_RATE);
+    fn build_engine(
+        config: AsrConfig, weights: HashMap<String, RawTensor>,
+        tokenizer: tokenizers::Tokenizer, backend: Backend,
+    ) -> anyhow::Result<Self> {
+        let mel_extractor = MelExtractor::new(
+            N_FFT, HOP_LENGTH,
+            config.thinker_config.audio_config.num_mel_bins,
+            MEL_SAMPLE_RATE,
+        );
         let resolved = backend.resolve()?;
 
         let engine = match resolved {
@@ -171,14 +164,15 @@ impl AsrInference {
     }
 }
 
+// ── Internal dispatch ─────────────────────────────────────────────
+
 impl AsrInferenceInner {
     fn run_inference(&self, samples: &[f32], options: &TranscribeOptions) -> anyhow::Result<TranscribeResult> {
         let audio_embeds = self.encode_audio(samples)?;
         let generated_ids = self.generate(&audio_embeds, options.language.as_deref(), None, options.max_new_tokens)?;
-        self.decode_result(&generated_ids, options.language.as_deref())
+        prompt::decode_result(&self.tokenizer, &generated_ids, options.language.as_deref())
     }
 
-    /// Run the audio encoder and return its output as a host-side `Vec<f32>` of shape [n_tokens, hidden].
     pub(crate) fn encode_audio(&self, samples: &[f32]) -> anyhow::Result<Vec<f32>> {
         match &self.engine {
             Engine::Cpu { audio_encoder, .. } => {
@@ -191,52 +185,23 @@ impl AsrInferenceInner {
                 Ok(out)
             }
             #[cfg(feature = "cuda")]
-            Engine::Cuda { cuda, audio_encoder, .. } => {
-                use half::f16;
+            Engine::Cuda { audio_encoder, .. } => {
                 let (mel_data, n_mels, n_frames) = self.mel_extractor.extract(samples)?;
                 debug!("Mel: {}×{} frames", n_mels, n_frames);
-
-                let cs = self.config.thinker_config.audio_config.n_window * 2;
-                let tpc = feo_inf(cs);
-                let nfull = n_frames / cs;
-                let tail = n_frames % cs;
-                let n_chunks = nfull + if tail > 0 { 1 } else { 0 };
-
-                let mut chunked = vec![f16::ZERO; n_chunks * n_mels * cs];
-                let mut chunk_tokens: Vec<usize> = Vec::with_capacity(n_chunks);
-                for i in 0..nfull {
-                    let s = i * cs;
-                    for m in 0..n_mels {
-                        let dst_base = (i * n_mels + m) * cs;
-                        let src_base = m * n_frames + s;
-                        for j in 0..cs {
-                            chunked[dst_base + j] = f16::from_f32(mel_data[src_base + j]);
-                        }
-                    }
-                    chunk_tokens.push(tpc);
-                }
-                if tail > 0 {
-                    let s = nfull * cs;
-                    for m in 0..n_mels {
-                        let dst_base = (nfull * n_mels + m) * cs;
-                        let src_base = m * n_frames + s;
-                        for j in 0..tail {
-                            chunked[dst_base + j] = f16::from_f32(mel_data[src_base + j]);
-                        }
-                    }
-                    chunk_tokens.push(feo_inf(tail));
-                }
-
-                let (out_f16, out_dim) = audio_encoder.run(&chunked, n_chunks, n_mels, cs, &chunk_tokens)?;
-                let n_tokens_out = out_f16.len() / out_dim;
-                info!("Audio tokens: {}", n_tokens_out);
-                Ok(out_f16.iter().map(|&v| f32::from(v)).collect())
+                let n_window = self.config.thinker_config.audio_config.n_window;
+                let out = audio_encoder.encode_from_mel(&mel_data, n_mels, n_frames, n_window)?;
+                let output_dim = self.config.thinker_config.audio_config.output_dim;
+                let n_tokens = out.len() / output_dim;
+                info!("Audio tokens: {}", n_tokens);
+                Ok(out)
             }
         }
     }
 
-    /// Run the text decoder.  `audio_embeds` is a host f32 vector of shape [n_tokens, hidden].
-    pub(crate) fn generate(&self, audio_embeds: &[f32], language: Option<&str>, prefix_text: Option<&str>, max_new_tokens: usize) -> anyhow::Result<Vec<u32>> {
+    pub(crate) fn generate(
+        &self, audio_embeds: &[f32], language: Option<&str>,
+        prefix_text: Option<&str>, max_new_tokens: usize,
+    ) -> anyhow::Result<Vec<u32>> {
         match &self.engine {
             Engine::Cpu { decoder, .. } => {
                 self.generate_cpu(decoder, audio_embeds, language, prefix_text, max_new_tokens)
@@ -253,11 +218,18 @@ impl AsrInferenceInner {
         audio_embeds: &[f32], language: Option<&str>, prefix_text: Option<&str>, max_new_tokens: usize,
     ) -> anyhow::Result<Vec<u32>> {
         use crate::cpu_engine::{CpuTensor, CpuKvCache, compute_mrope_cos_sin as cpu_mrope};
+        use crate::prompt::{IM_END_TOKEN_ID, ENDOFTEXT_TOKEN_ID};
 
         let text_cfg = &self.config.thinker_config.text_config;
         let hidden_size = text_cfg.hidden_size;
         let nat = audio_embeds.len() / hidden_size;
-        let (input_ids, audio_start_pos) = self.build_prompt(nat, language, prefix_text)?;
+        let (input_ids, audio_start_pos) = prompt::build_prompt(
+            &self.tokenizer,
+            self.config.thinker_config.audio_start_token_id,
+            self.config.thinker_config.audio_token_id,
+            self.config.thinker_config.audio_end_token_id,
+            nat, language, prefix_text,
+        )?;
         let seq_len = input_ids.len();
 
         let before_ids: Vec<i64> = input_ids[..audio_start_pos].to_vec();
@@ -300,11 +272,8 @@ impl AsrInferenceInner {
             if eos_ids.contains(&next_token) { break; }
             generated_ids.push(next_token as u32);
 
-            let ne = cpu.embed_ids(&[next_token])
-                .reshape(vec![1, 1, hidden_size]);
-            let sl = cpu.forward(
-                ne, &cos_table, &sin_table, &mut kv_cache, current_pos, false, true,
-            );
+            let ne = cpu.embed_ids(&[next_token]).reshape(vec![1, 1, hidden_size]);
+            let sl = cpu.forward(ne, &cos_table, &sin_table, &mut kv_cache, current_pos, false, true);
             next_token = crate::cpu_engine::argmax(&sl.data) as i64;
             current_pos += 1;
         }
@@ -324,9 +293,16 @@ impl AsrInferenceInner {
     ) -> anyhow::Result<Vec<u32>> {
         use half::f16;
         use crate::cudarc_engine::{CpuTensor, GpuKvCache, DecodeScratch};
+        use crate::prompt::{IM_END_TOKEN_ID, ENDOFTEXT_TOKEN_ID};
 
         let nat = audio_embeds.len() / self.config.thinker_config.text_config.hidden_size;
-        let (input_ids, audio_start_pos) = self.build_prompt(nat, language, prefix_text)?;
+        let (input_ids, audio_start_pos) = prompt::build_prompt(
+            &self.tokenizer,
+            self.config.thinker_config.audio_start_token_id,
+            self.config.thinker_config.audio_token_id,
+            self.config.thinker_config.audio_end_token_id,
+            nat, language, prefix_text,
+        )?;
         let seq_len = input_ids.len();
         let hidden_size = self.config.thinker_config.text_config.hidden_size;
         let text_cfg = &self.config.thinker_config.text_config;
@@ -359,7 +335,7 @@ impl AsrInferenceInner {
 
         let mut kv_cache = GpuKvCache::new(
             cuda, text_cfg.num_hidden_layers, 1,
-            text_cfg.num_key_value_heads, total_positions, text_cfg.head_dim
+            text_cfg.num_key_value_heads, total_positions, text_cfg.head_dim,
         )?;
 
         let logits = decoder.forward(hidden_states, &cos_table, &sin_table, &mut kv_cache, 0, true, true)?;
@@ -377,7 +353,6 @@ impl AsrInferenceInner {
         let mut h_buf = scratch.embed_out.clone();
 
         let t_decode = std::time::Instant::now();
-
         loop {
             if eos_ids.contains(&next_token) { break; }
             generated_ids.push(next_token as u32);
@@ -401,97 +376,4 @@ impl AsrInferenceInner {
         info!("Generated {} tokens", generated_ids.len());
         Ok(generated_ids)
     }
-
-    pub(crate) fn decode_result(&self, generated_ids: &[u32], language: Option<&str>) -> anyhow::Result<TranscribeResult> {
-        let raw_text = self.tokenizer.decode(generated_ids, true).map_err(|e| anyhow::anyhow!("decode: {}", e))?;
-        let (lang, text) = if language.is_some() {
-            ("forced".to_string(), raw_text.trim().to_string())
-        } else if let Some(sep_pos) = generated_ids.iter().position(|&id| id == ASR_TEXT_SEP_TOKEN_ID) {
-            let lang_ids: Vec<u32> = generated_ids[..sep_pos].to_vec();
-            let text_ids: Vec<u32> = generated_ids[sep_pos + 1..].to_vec();
-            let lang_raw = self.tokenizer.decode(&lang_ids, true).map_err(|e| anyhow::anyhow!("decode lang: {}", e))?;
-            let text_raw = self.tokenizer.decode(&text_ids, true).map_err(|e| anyhow::anyhow!("decode text: {}", e))?;
-            (lang_raw.strip_prefix("language ").unwrap_or(&lang_raw).trim().to_string(), text_raw.trim().to_string())
-        } else { parse_asr_output(&raw_text, false) };
-        Ok(TranscribeResult { text, language: lang, raw_output: raw_text })
-    }
-
-    pub(crate) fn tokenizer_decode(&self, ids: &[u32]) -> anyhow::Result<String> {
-        self.tokenizer.decode(ids, true).map_err(|e| anyhow::anyhow!("decode: {}", e))
-    }
-
-    pub(crate) fn build_prompt(&self, nat: usize, language: Option<&str>, prefix_text: Option<&str>) -> anyhow::Result<(Vec<i64>, usize)> {
-        let cfg = &self.config.thinker_config;
-        let mut tokens: Vec<i64> = vec![TOK_IM_START, TOK_SYSTEM, TOK_NEWLINE, TOK_IM_END, TOK_NEWLINE, TOK_IM_START, TOK_USER, TOK_NEWLINE, cfg.audio_start_token_id];
-        let asp = tokens.len();
-        tokens.extend(std::iter::repeat_n(cfg.audio_token_id, nat));
-        tokens.extend_from_slice(&[cfg.audio_end_token_id, TOK_IM_END, TOK_NEWLINE, TOK_IM_START]);
-        if let Some(lang) = language {
-            tokens.push(TOK_ASSISTANT); tokens.push(TOK_NEWLINE);
-            let lang_str = format!("language {}", capitalize_first(lang));
-            let enc = self.tokenizer.encode(lang_str.as_str(), false).map_err(|e| anyhow::anyhow!("encode: {}", e))?;
-            tokens.extend(enc.get_ids().iter().map(|&id| id as i64));
-        } else { tokens.push(TOK_ASSISTANT); tokens.push(TOK_NEWLINE); }
-        if let Some(prefix) = prefix_text { if !prefix.is_empty() {
-            let enc = self.tokenizer.encode(prefix, false).map_err(|e| anyhow::anyhow!("encode prefix: {}", e))?;
-            tokens.extend(enc.get_ids().iter().map(|&id| id as i64));
-        }}
-        Ok((tokens, asp))
-    }
-}
-
-fn parse_asr_output(raw: &str, forced: bool) -> (String, String) {
-    if forced { return ("forced".to_string(), raw.trim().to_string()); }
-    let raw = raw.trim();
-    if let Some(rest) = raw.strip_prefix("language ") {
-        if let Some(pos) = rest.find("<asr_text>") { return (rest[..pos].trim().to_string(), rest[pos + "<asr_text>".len()..].trim().to_string()); }
-        let mut le = rest.len();
-        for (i, c) in rest.char_indices() { if c.is_whitespace() || !c.is_alphabetic() { le = i; break; } }
-        if le > 0 && le < rest.len() { return (rest[..le].to_string(), rest[le..].trim().to_string()); }
-    }
-    ("unknown".to_string(), raw.to_string())
-}
-
-fn capitalize_first(s: &str) -> String {
-    let mut c = s.chars(); match c.next() { None => String::new(), Some(f) => f.to_uppercase().collect::<String>() + c.as_str() }
-}
-
-/// Conv-stem token-count formula: 3 stride-2 convs reduce sequence length to ((((l-1)/2+1)-1)/2+1)/2+1.
-#[cfg(feature = "cuda")]
-fn feo_inf(l: usize) -> usize {
-    let f = |x: usize| (x - 1) / 2 + 1;
-    f(f(f(l)))
-}
-
-// ─── Weight loading ──────────────────────────────────────────────
-
-fn load_weights(model_dir: &Path) -> anyhow::Result<HashMap<String, RawTensor>> {
-    let index_path = model_dir.join("model.safetensors.index.json");
-    if index_path.exists() {
-        let idx: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&index_path)?)?;
-        let wm = idx["weight_map"].as_object().ok_or_else(|| anyhow::anyhow!("invalid index.json"))?;
-        let mut sf: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for v in wm.values() { if let Some(s) = v.as_str() { sf.insert(s.to_string()); } }
-        let mut all = HashMap::new();
-        for s in sf { all.extend(load_safetensors_file(&model_dir.join(&s))?); }
-        return Ok(all);
-    }
-    load_safetensors_file(&model_dir.join("model.safetensors"))
-}
-
-fn load_safetensors_file(path: &Path) -> anyhow::Result<HashMap<String, RawTensor>> {
-    let buf = std::fs::read(path)?;
-    let st = safetensors::SafeTensors::deserialize(&buf).map_err(|e| anyhow::anyhow!("safetensors: {}", e))?;
-    let names = st.names();
-    let tensors = st.tensors();
-    let mut weights = HashMap::new();
-    for i in 0..names.len() {
-        let name = names[i];
-        let view = &tensors[i];
-        let data = view.1.data().to_vec();
-        let shape: Vec<usize> = view.1.shape().to_vec();
-        let dtype = view.1.dtype();
-        weights.insert(name.to_string(), RawTensor { data, shape, dtype });
-    }
-    Ok(weights)
 }

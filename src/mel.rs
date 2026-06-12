@@ -1,6 +1,10 @@
 use anyhow::Result;
 use rustfft::{num_complex::Complex, FftPlanner};
 
+pub(crate) const MEL_SAMPLE_RATE: u32 = 16000;
+pub(crate) const N_FFT: usize = 400;
+pub(crate) const HOP_LENGTH: usize = 160;
+
 fn hann_window(n: usize) -> Vec<f32> {
     (0..n)
         .map(|i| {

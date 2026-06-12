@@ -20,27 +20,8 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 
 use crate::config::AudioEncoderConfig;
-use crate::cpu_engine::{linear, CpuTensor, CpuWeight};
+use crate::cpu_engine::{linear, CpuTensor, CpuWeight, CpuWeightF16};
 use crate::raw_tensor::RawTensor;
-
-// ─── f16 weight storage ────────────────────────────────────────────
-
-/// Weight matrix stored as f16 — halved memory vs f32.
-/// Converted to f32 on-the-fly before GEMM via `to_f32()`.
-pub(crate) struct CpuWeightF16 {
-    pub data: Vec<half::f16>,
-    pub rows: usize,
-    pub cols: usize,
-}
-
-impl CpuWeightF16 {
-    /// Convert f16 → f32 sequentially. Called once per GEMM invocation.
-    /// Sequential avoids rayon task spawn overhead for ~100 calls/forward.
-    fn to_f32(&self) -> CpuWeight {
-        let data: Vec<f32> = self.data.iter().map(|v| v.to_f32()).collect();
-        CpuWeight { data, rows: self.rows, cols: self.cols }
-    }
-}
 
 // ─── Linear + LayerNorm primitives ─────────────────────────────────
 
