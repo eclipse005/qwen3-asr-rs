@@ -46,3 +46,50 @@ fn run_cpu(name: &str, wav: &str, duration_s: f32) {
 #[test] fn test_cpu_89s_ja()   { run_cpu("89s_ja",    "ja_89s.wav",   89.0); }
 #[test] fn test_cpu_180s()     { run_cpu("180s",      "180s.wav",    180.0); }
 #[test] fn test_cpu_180s_en()  { run_cpu("180s_en",   "180s_en.wav", 180.0); }
+
+/// Verify streaming produces identical final result as non-streaming.
+#[test]
+fn test_cpu_streaming_matches_nonstreaming() {
+    let engine = qwen3_asr::AsrInference::load(
+        std::path::Path::new(&model_dir_06()), qwen3_asr::Backend::Cpu,
+    ).expect("load 0.6B CPU");
+
+    let options = qwen3_asr::TranscribeOptions::default();
+    let wav = fixture("sample1.wav");
+
+    // Non-streaming baseline
+    let baseline = engine.transcribe(&wav, qwen3_asr::TranscribeOptions::default())
+        .expect("non-streaming transcribe");
+
+    // Streaming — collect all tokens
+    let mut tokens: Vec<qwen3_asr::StreamToken> = Vec::new();
+    let result = engine.transcribe_streaming(&wav, options, |t| {
+        tokens.push(t);
+    }).expect("streaming transcribe");
+
+    // Final results must match
+    assert_eq!(result.text, baseline.text, "streaming text must match non-streaming");
+    assert_eq!(result.language, baseline.language, "streaming language must match");
+    assert_eq!(result.raw_output, baseline.raw_output, "streaming raw_output must match");
+
+    // Should have received at least one token
+    assert!(!tokens.is_empty(), "should receive streaming tokens");
+
+    // Last token's text_so_far should be a prefix of raw_output (may differ by trimming)
+    assert!(
+        result.raw_output.starts_with(tokens.last().unwrap().text_so_far.trim())
+            || tokens.last().unwrap().text_so_far.trim().starts_with(&result.raw_output),
+        "last streaming text should match raw output:\n  last={:?}\n  raw={:?}",
+        tokens.last().unwrap().text_so_far, result.raw_output,
+    );
+
+    // Each token should have progressively longer text
+    for w in tokens.windows(2) {
+        assert!(
+            w[1].text_so_far.len() >= w[0].text_so_far.len(),
+            "streaming text should be monotonically non-decreasing"
+        );
+    }
+
+    println!("Streaming test passed: {} tokens, text matches", tokens.len());
+}

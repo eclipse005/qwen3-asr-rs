@@ -45,6 +45,15 @@ pub struct TranscribeResult {
     pub raw_output: String,
 }
 
+/// Emitted once per generated token during streaming transcription.
+#[non_exhaustive]
+pub struct StreamToken {
+    /// The token ID just produced by the decoder.
+    pub token_id: u32,
+    /// Raw decoded text of all generated tokens so far (incremental).
+    pub text_so_far: String,
+}
+
 // ── Engine enum ───────────────────────────────────────────────────
 
 enum Engine {
@@ -72,6 +81,8 @@ unsafe impl Send for AsrInferenceInner {}
 pub struct AsrInference {
     pub(crate) inner: Mutex<AsrInferenceInner>,
 }
+
+// ── Public entry points ───────────────────────────────────────────
 
 impl AsrInference {
     pub fn load(model_dir: &Path, backend: Backend) -> crate::Result<Self> {
@@ -150,6 +161,8 @@ impl AsrInference {
         })
     }
 
+    // ── Non-streaming API ─────────────────────────────────────────
+
     pub fn transcribe(&self, audio_path: &str, options: TranscribeOptions) -> crate::Result<TranscribeResult> {
         info!("Loading audio: {}", audio_path);
         let samples = load_audio_wav(audio_path, MEL_SAMPLE_RATE)?;
@@ -162,6 +175,34 @@ impl AsrInference {
         let inner = self.inner.lock().map_err(|_| AsrError::Inference(anyhow::anyhow!("mutex poisoned")))?;
         inner.run_inference(samples, &options).map_err(AsrError::Inference)
     }
+
+    // ── Streaming API ──────────────────────────────────────────────
+
+    /// Streaming variant of `transcribe`. `on_token` is called for each
+    /// generated token with the incremental decoded text so far.
+    /// Returns the final `TranscribeResult` when done.
+    pub fn transcribe_streaming<F>(
+        &self, audio_path: &str, options: TranscribeOptions, on_token: F,
+    ) -> crate::Result<TranscribeResult>
+    where
+        F: FnMut(StreamToken),
+    {
+        info!("Loading audio: {}", audio_path);
+        let samples = load_audio_wav(audio_path, MEL_SAMPLE_RATE)?;
+        info!("Audio: {} samples @ {}Hz", samples.len(), MEL_SAMPLE_RATE);
+        self.transcribe_samples_streaming(&samples, options, on_token)
+    }
+
+    /// Streaming variant of `transcribe_samples`.
+    pub fn transcribe_samples_streaming<F>(
+        &self, samples: &[f32], options: TranscribeOptions, mut on_token: F,
+    ) -> crate::Result<TranscribeResult>
+    where
+        F: FnMut(StreamToken),
+    {
+        let inner = self.inner.lock().map_err(|_| AsrError::Inference(anyhow::anyhow!("mutex poisoned")))?;
+        inner.run_inference_streaming(samples, &options, &mut on_token).map_err(AsrError::Inference)
+    }
 }
 
 // ── Internal dispatch ─────────────────────────────────────────────
@@ -171,6 +212,27 @@ impl AsrInferenceInner {
         let audio_embeds = self.encode_audio(samples)?;
         let generated_ids = self.generate(&audio_embeds, options.language.as_deref(), None, options.max_new_tokens)?;
         prompt::decode_result(&self.tokenizer, &generated_ids, options.language.as_deref())
+    }
+
+    fn run_inference_streaming<F>(
+        &self, samples: &[f32], options: &TranscribeOptions, on_token: &mut F,
+    ) -> anyhow::Result<TranscribeResult>
+    where
+        F: FnMut(StreamToken),
+    {
+        let audio_embeds = self.encode_audio(samples)?;
+        let tokenizer = &self.tokenizer;
+        let mut all_ids: Vec<u32> = Vec::new();
+        let mut streaming_cb = |token_id: u32| {
+            all_ids.push(token_id);
+            let text = tokenizer.decode(&all_ids, true).unwrap_or_default();
+            on_token(StreamToken { token_id, text_so_far: text });
+        };
+        let final_ids = self.generate_with_callback(
+            &audio_embeds, options.language.as_deref(), None, options.max_new_tokens,
+            &mut streaming_cb,
+        )?;
+        prompt::decode_result(&self.tokenizer, &final_ids, options.language.as_deref())
     }
 
     pub(crate) fn encode_audio(&self, samples: &[f32]) -> anyhow::Result<Vec<f32>> {
@@ -198,24 +260,35 @@ impl AsrInferenceInner {
         }
     }
 
+    /// Non-streaming generate (no-op callback).
     pub(crate) fn generate(
         &self, audio_embeds: &[f32], language: Option<&str>,
         prefix_text: Option<&str>, max_new_tokens: usize,
     ) -> anyhow::Result<Vec<u32>> {
+        self.generate_with_callback(audio_embeds, language, prefix_text, max_new_tokens, &mut |_| {})
+    }
+
+    /// Core generate with per-token callback. Used by both streaming and non-streaming paths.
+    fn generate_with_callback(
+        &self, audio_embeds: &[f32], language: Option<&str>,
+        prefix_text: Option<&str>, max_new_tokens: usize,
+        on_token: &mut dyn FnMut(u32),
+    ) -> anyhow::Result<Vec<u32>> {
         match &self.engine {
             Engine::Cpu { decoder, .. } => {
-                self.generate_cpu(decoder, audio_embeds, language, prefix_text, max_new_tokens)
+                self.generate_cpu(decoder, audio_embeds, language, prefix_text, max_new_tokens, on_token)
             }
             #[cfg(feature = "cuda")]
             Engine::Cuda { cuda, decoder, .. } => {
-                self.generate_cuda(cuda, decoder, audio_embeds, language, prefix_text, max_new_tokens)
+                self.generate_cuda(cuda, decoder, audio_embeds, language, prefix_text, max_new_tokens, on_token)
             }
         }
     }
 
     fn generate_cpu(
         &self, cpu: &CpuTextDecoder,
-        audio_embeds: &[f32], language: Option<&str>, prefix_text: Option<&str>, max_new_tokens: usize,
+        audio_embeds: &[f32], language: Option<&str>, prefix_text: Option<&str>,
+        max_new_tokens: usize, on_token: &mut dyn FnMut(u32),
     ) -> anyhow::Result<Vec<u32>> {
         use crate::cpu_engine::{CpuTensor, CpuKvCache, compute_mrope_cos_sin as cpu_mrope};
         use crate::prompt::{IM_END_TOKEN_ID, ENDOFTEXT_TOKEN_ID};
@@ -271,6 +344,7 @@ impl AsrInferenceInner {
         for _step in 0..max_new_tokens {
             if eos_ids.contains(&next_token) { break; }
             generated_ids.push(next_token as u32);
+            on_token(next_token as u32);
 
             let ne = cpu.embed_ids(&[next_token]).reshape(vec![1, 1, hidden_size]);
             let sl = cpu.forward(ne, &cos_table, &sin_table, &mut kv_cache, current_pos, false, true);
@@ -289,7 +363,8 @@ impl AsrInferenceInner {
     #[cfg(feature = "cuda")]
     fn generate_cuda(
         &self, cuda: &Arc<CudaState>, decoder: &GpuTextDecoder,
-        audio_embeds: &[f32], language: Option<&str>, prefix_text: Option<&str>, max_new_tokens: usize,
+        audio_embeds: &[f32], language: Option<&str>, prefix_text: Option<&str>,
+        max_new_tokens: usize, on_token: &mut dyn FnMut(u32),
     ) -> anyhow::Result<Vec<u32>> {
         use half::f16;
         use crate::cudarc_engine::{CpuTensor, GpuKvCache, DecodeScratch};
@@ -356,6 +431,7 @@ impl AsrInferenceInner {
         loop {
             if eos_ids.contains(&next_token) { break; }
             generated_ids.push(next_token as u32);
+            on_token(next_token as u32);
             if generated_ids.len() >= max_new_tokens { break; }
 
             cuda.embed_id_from_gpu_slot_into(&decoder.embed_table, &token_buf, 0, &mut h_buf)?;

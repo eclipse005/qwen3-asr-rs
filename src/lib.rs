@@ -18,5 +18,5 @@ mod cpu_audio_encoder;
 
 pub use backend::Backend;
 pub use error::{AsrError, Result};
-pub use inference::{AsrInference, TranscribeOptions, TranscribeResult};
+pub use inference::{AsrInference, TranscribeOptions, TranscribeResult, StreamToken};
 pub use mel::load_audio_wav;
