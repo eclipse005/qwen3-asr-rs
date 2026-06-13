@@ -25,9 +25,8 @@ src/
 ├── gpu_audio_encoder.rs  # ★ 手写 GPU 音频编码器（cuBLAS + 自定义 conv2d/im2col）
 └── kernels/kernels.cu    # 所有 CUDA kernel（运行时 NVRTC 编译）
 tests/
-├── transcribe.rs          # 13 个 #[ignore] CUDA 集成测试（0.6B/1.7B × 各种时长）
-├── cpu_transcribe.rs      # 7 个 CPU 集成测试（0.6B × 全 fixture）
-├── cpu_90s.rs             # 90s 单独 CPU 测试（独立进程跑，可单独 benchmark）
+├── transcribe.rs          # #[ignore] CUDA 集成测试（0.6B/1.7B × 各种时长 + streaming demo）
+├── cpu_transcribe.rs      # CPU 集成测试（0.6B + 1.7B × 全 fixture + streaming；RTFx + 峰值 RSS）
 └── fixtures/              # 7 个 wav: sample1 / 15s / 30s / 90s / 89s_ja / 180s / 180s_en
 ```
 
@@ -46,20 +45,37 @@ hub  = ["dep:reqwest"]
 
 ### 1.4 性能（基准线，P104-100）
 
-#### CPU 0.6B（Ryzen/Intel，INT8 weight-only 量化，默认）
+#### CPU（Intel Core Ultra 7 265K，Arrow Lake，20c，AVX2；31.5GB RAM；INT8 weight-only 量化，默认）
 
-解码器 4 个 linear（qkv/o/gate_up/down）走 INT8（per-channel 对称量化 + AVX2 GEMV，运行时 `is_x86_feature_detected!` 分发 + 标量 fallback）；lm_head/embed_table/音频编码器仍 f16。解码器 body 永久 INT8，无开关、无 f16 回退分支。
+解码器 4 个 linear（qkv/o/gate_up/down）走 INT8（per-channel 对称量化 + AVX2 GEMV，运行时 `is_x86_feature_detected!` 分发 + 标量 fallback）；lm_head/embed_table/音频编码器仍 f16。解码器 body 永久 INT8，无开关、无 f16 回退分支。RTFx + 峰值 RSS 来自每 fixture 独立进程（Win32 `GetProcessMemoryInfo` PeakWorkingSet，在 `cpu_transcribe.rs::run_cpu_with` 里抓）。
 
-| 音频 | RTFx (INT8) | 耗时 | vs f16 提速 |
+**0.6B**
+
+| 音频 | RTFx | 耗时 | 峰值 RSS |
 |---|---|---|---|
-| 15s 英文 | 4.94× | 3.0s | 1.23× |
-| 30s 中文 | 5.48× | 5.5s | 1.57× |
-| 90s 英文 | 5.82× | 15.5s | 1.52× |
-| 89s 日文 | 6.10× | 14.6s | 1.57× |
-| 180s 中文 | 5.35× | 33.6s | 1.40× |
-| 180s 英文 | 5.47× | 32.9s | 1.38× |
+| 15s 英文 | 4.91× | 3.0s | 3584 MB |
+| 30s 中文 | 5.55× | 5.4s | ~3584 MB |
+| 90s 英文 | 5.75× | 15.6s | 3584 MB |
+| 89s 日文 | 6.21× | 14.3s | ~3584 MB |
+| 180s 中文 | 5.34× | 33.7s | 5134 MB |
+| 180s 英文 | 5.50× | 32.7s | 5134 MB |
 
-精度：全 7 fixture 归一化 CER ~1%（英文/中文短音频全过；180s 中文 ~3.6%、89s 日文 ~1.9% raw，但绝大多数是标点/合法改写，真实存疑字 <1%，集中在同音决策边界）。
+**1.7B**（首次 CPU 基线）
+
+| 音频 | RTFx | 耗时 | 峰值 RSS |
+|---|---|---|---|
+| 15s 英文 | 2.23× | 6.7s | 8056 MB |
+| 30s 中文 | 2.58× | 11.6s | 8056 MB |
+| 90s 英文 | 3.21× | 28.1s | 8056 MB |
+| 89s 日文 | 3.59× | 24.8s | 8056 MB |
+| 180s 中文 | 2.92× | 61.7s | 8512 MB |
+| 180s 英文 | 3.01× | 59.8s | 8512 MB |
+
+观察：1.7B RTFx 在 89s_ja 见顶（3.59×）后 180s 回落（2.92×）——长音频 prefill 的 O(s²) attention 曾拖低 RTFx，**已于 2026-06-13 修复**（见下）。峰值 RSS：15-90s 权重主导（0.6B ~3.5GB、1.7B ~8GB，与音频长度无关），180s 因 prefill attention scores scratch 抬高（0.6B +1.5GB → 5134MB；1.7B +0.5GB，其 seq_len 较短故增幅小）。
+
+**2026-06-13 优化：prefill attention SSE2-标量 → gemm crate（AVX2-FMA）。** 原 `prefill_attention` 两个矩阵乘（scores=q@Kᵀ、out=scores@V）是手写标量循环，release 默认 baseline 只编到 SSE2（4 float/周期），而同文件 GEMM 走 gemm crate 的 AVX2-FMA（8/周期）—— attention 占 prefill ~60%，故成 prefill 瓶颈。改用 gemm crate 调用（stride 参数直接读写 q/out 交错布局，免 gather/scatter；外层 rayon 跨 (b,qh)，内层 `Parallelism::None` 避免嵌套并行超订）。**实测（进程内直接计时，不受热噪声影响）：attn 182→91ms/层（2×），prefill 总 8845→5791ms @0.6B-180s（−34%）。** 180s isolated RTFx 5.34→5.79×（+8%，且本次实测在热降频下仍成立 → 真实收益 ≥8%）。短音频按 prefill 占比递减（15s 的 seq_len ~375，gemm 仍适用，无大小分发必要）。零精度风险（数学等价，仅 SSE2→AVX2 求和重排）。注：本 VM（CPUID 撒谎 + 持续负载热降频）cross-run total RTFx 噪声大，**prefill 的进程内计时是可靠信号**。单测 `prefill_attention_matches_reference` 锁正确性。
+
+精度：0.6B 全 7 fixture 归一化 CER ~1%（英文/中文短音频全过；180s 中文 ~3.6%、89s 日文 ~1.9% raw，但绝大多数是标点/合法改写，真实存疑字 <1%，集中在同音决策边界）。
 
 #### CUDA 0.6B（P104-100，Pascal sm_61）
 
@@ -89,7 +105,11 @@ hub  = ["dep:reqwest"]
 
 ### 1.5 内存
 
-90s 音频 0.6B CPU 峰值工作集约 **3,520 MB**（INT8 默认，与 f16 持平 ~3,522 MB）。INT8 只减解码器 body 权重存储（f16→i8，~205MB），但 prefill 仍把权重反量化成 f32 跑 gemm，峰值由 prefill 激活主导，故 RSS 不降。f16 权重相对纯 f32 仍省 ~25%（3.5GB vs 4.66GB）。
+CPU 峰值 RSS 随音频长度分两段（INT8 默认；每 fixture 独立进程实测，Win32 PeakWorkingSet）：
+- **15-90s**：权重主导、基本恒定。0.6B ~3,584 MB、1.7B ~8,056 MB（与 15s 持平）。INT8 只减解码器 body 权重存储（f16→i8，0.6B 省 ~205MB）；prefill 把权重反量化成 f32 跑 gemm 的临时 f32 权重（每层最大 ~25MB，用完即释）不主导峰值。
+- **180s**：prefill attention 的 O(s²) scores scratch（20 线程并发 × s×cur_len×4B ≈ 1.5GB）把峰值抬高。0.6B → 5,134 MB（+1.5GB），1.7B → 8,512 MB（+0.5GB，1.7B seq_len 较短故增幅小）。
+
+f16 权重相对纯 f32 仍省 ~25%（0.6B 3.5GB vs 4.66GB）。
 
 ## 2. 关键架构事实
 
@@ -203,6 +223,7 @@ kernel 存在（`lm_head_gemv_argmax_f16`）但注释说"目前输给 cuBLAS"，
 - [x] CPU 端到端 transcribe 全部 fixture 通过
 - [x] f16 权重存储（音频编码器 + 文本解码器），内存节省 ~25%
 - [x] CPU 文本解码器 INT8 weight-only 量化（per-channel 对称 + AVX2 GEMV，默认开启；RTFx 1.2-1.6×，归一化 CER ~1%；内存持平）
+- [x] CPU prefill attention：手写 SSE2-标量 → gemm crate（AVX2-FMA）。attn 182→91ms/层（2×），prefill −34% @180s，180s RTFx +8%。零精度风险。单测 `prefill_attention_matches_reference`（见 §1.4）
 - [x] GPU 全部 13 个集成测试通过
 - [x] CUDA Graph 死代码清理
 - [x] 脱离 burn 框架
@@ -218,9 +239,9 @@ kernel 存在（`lm_head_gemv_argmax_f16`）但注释说"目前输给 cuBLAS"，
 ### 5.2 P2：CPU 优化
 
 - [x] **INT8 weight-only 量化 + AVX2 GEMV** — 已完成并收口（解码器 body 永久 INT8，无 f16 回退分支）。decode 路径 RTFx 1.2-1.6×（见 §1.4）。
-- [ ] **prefill 也走 INT8 GEMM**（当前 prefill 反量化到 f32，是峰值 RSS 不降的原因，也是 prefill 耗时大头）
+- [ ] **prefill 也走 INT8 GEMM**（当前 prefill 的 4 个 linear 仍反量化到 f32 跑 gemm；是峰值 RSS 不降的原因，也是 prefill 剩余大头。注：prefill attention 已改 gemm crate，见 §4）
 - [ ] **im2col SIMD** — 卷积 im2col 生成目前是标量赋值
-- [ ] **注意力微优化** — 目前标量 + rayon 跨 head，可尝试分块矩阵乘
+- [x] **prefill attention** — 已从 SSE2-标量改 gemm crate（AVX2），2×（见 §4）。decode attention（`fused_gqa_decode`）仍是标量，但 KV 流读已近 DRAM 峰值（~72/80 GB/s），bandwidth-bound，SIMD 收益小；若要进一步压 decode，考虑 KV cache f16（半带宽，有精度权衡）
 - [ ] 更激进的 rayon 策略（跨层并行？prefill 阶段流水线？）
 
 ### 5.3 P3：功能
@@ -253,7 +274,9 @@ kernel 存在（`lm_head_gemv_argmax_f16`）但注释说"目前输给 cuBLAS"，
 - **CPU f16→f32 转换**：音频编码器顺序转（100+ 次小权重，rayon 开销大于收益）；文本解码器 prefill 用 rayon 转（大权重 ~1.2GB，rayon 明显更快）
 - **`half` crate v2** 是无条件依赖（不是 optional），GPU 和 CPU 路径都用
 - **CPU 解码器 body 永久 INT8**（per-channel 对称 + AVX2 GEMV，`is_x86_feature_detected!` 分发）。4 个 decoder linear 在 `CpuDecoderLayer::load` 时从 f16 量化成 `CpuWeightI8`；lm_head/embed_table/音频编码器仍 f16（`linear_gemv_f16`）。无开关、无 f16 回退分支。INT8 是**提速**优化，**不减峰值内存**（prefill 仍反量化 f32）。
-- **CER 对照工具**：`examples/cer_compare.rs`（解析两次 transcribe stdout 算 raw + 归一化 CER）；`examples/mem_probe.ps1`（轮询测试进程峰值 RSS）。
+- **AVX-VNNI 在本开发 VM 是 CPUID 假阳性**（`is_x86_feature_detected!("avxvnni")` 返回 true，但执行 `_mm256_dpbusd_epi32` 直接 `STATUS_ILLEGAL_INSTRUCTION` —— hypervisor 透传了 VNNI 标志位但不支持执行）。所以 CPU INT8 GEMV 只用 AVX2 `madd` 路径，**不要尝试 VNNI**（曾试过，崩；代码已还原）。真实 Arrow Lake 硬件上 VNNI 理论可用但本环境无法验证。decode GEMV 的进一步提速需等真实 VNNI 硬件或换思路（如 KV cache f16 / 投机解码）。
+- **本 VM 持续负载热降频严重**：cross-run 的 total RTFx 噪声大（连续跑会越跑越慢）。要测 total RTFx 须凉机单跑；**进程内直接计时（如 generate_cpu 的 `info!("Prefill/Decode ms")`、cpu_engine 的采样 pmark）不受热噪声影响，是可靠信号**。
+- **CER 对照工具**：`examples/cer_compare.rs`（解析两次 transcribe stdout 算 raw + 归一化 CER）。峰值 RSS 已折进 `cpu_transcribe.rs::run_cpu_with`（in-process Win32 `GetProcessMemoryInfo`，每 fixture 独立进程）；`examples/mem_probe.ps1` 是旧的 100ms 轮询版（其 `QASR_CPU_INT8` 开关是死代码——INT8 永久，无开关），已被取代。
 
 ## 7. 给接手 AI 的具体操作
 

@@ -729,56 +729,60 @@ impl CpuDecoderLayer {
     }
 }
 
-// Prefill-path attention: materialise scores [b, nqh, s, cur_len], softmax, out = attn · V.
-// q is laid out as [b, s, nqh, hd] (the natural per-token output of qkv_extract).
-// Returns out in the same [b, s, nqh, hd] layout so the caller can reshape directly to
-// [b, s, nqh*hd] for the O projection without a swap.
-// One rayon job per (b, qh).
+// Prefill-path attention: scores = q @ K^T, softmax, out = scores @ V.  Both matmuls go through
+// the `gemm` crate (AVX2-FMA + cache tiling) rather than hand-rolled scalar loops — those
+// compiled to SSE2-only on the default baseline and dominated prefill (~60% at 180s).  Layouts:
+//   q bytes:   [b, s, nqh, hd]   — q[ib, i, qh, :] at ((ib*s+i)*nqh + qh)*hd, stride nqh*hd per token
+//   k/v cache: [b, nkvh, max_seq, hd] → per (ib, kh) a contiguous [cur_len, hd] view
+//   out bytes: [b, s, nqh, hd]   — same strided layout as q
+// GQA: n_rep = nqh/nkvh query heads share each kv-head's K/V.  One rayon job per (b, qh); the
+// gemm calls use Parallelism::None (single-threaded per job) so the b*nqh jobs fill the cores
+// without nested-parallelism oversubscription.  The gemm stride API reads q / writes out in
+// place — no gather/scatter temporaries.
 fn prefill_attention(
     q: &CpuTensor,
     k_cache: &[f32], v_cache: &[f32],
     b: usize, nqh: usize, nkvh: usize, max_seq: usize, hd: usize, cur_len: usize,
     causal: bool,
 ) -> CpuTensor {
-    // q.shape is logically [b, nqh, s, hd] but the bytes are actually [b, s, nqh, hd].
     let s = q.shape[2];
     let n_rep = nqh / nkvh;
     let scale = 1.0f32 / (hd as f32).sqrt();
+    let tok_stride = (nqh * hd) as isize; // f32 elements between consecutive tokens in q / out
     let out = vec![0.0f32; b * s * nqh * hd];
 
-    // Each rayon job handles one (b, qh) — it owns a strided view of the output (length s*hd).
-    // We compute scores [s, cur_len], softmax, then matmul with V to produce out[ib, :, qh, :].
     (0..b * nqh).into_par_iter().for_each(|idx| {
         let ib = idx / nqh;
         let qh = idx % nqh;
         let kh = qh / n_rep;
-        let k_base = (ib * nkvh + kh) * max_seq * hd;
-        let v_base = (ib * nkvh + kh) * max_seq * hd;
+        let kv_base = (ib * nkvh + kh) * max_seq * hd;
+        let k_head = &k_cache[kv_base..kv_base + cur_len * hd]; // [cur_len, hd]
+        let v_head = &v_cache[kv_base..kv_base + cur_len * hd];
+        let head_off = ((ib * s) * nqh + qh) * hd; // start of q[ib,0,qh,:] and out[ib,0,qh,:]
 
-        // Pre-extract Q for this (ib, qh) across all s tokens into a small contiguous buffer.
-        let mut q_qh = vec![0.0f32; s * hd];
-        for i in 0..s {
-            let src = ((ib * s + i) * nqh + qh) * hd;
-            q_qh[i * hd..(i + 1) * hd].copy_from_slice(&q.data[src..src + hd]);
-        }
-
+        // scores[s, cur_len] = q[ib,:,qh,:] @ K_head^T  (q read with per-token stride; no gather).
         let mut scores = vec![0.0f32; s * cur_len];
-        // scores[i, t] = q[i, :] · K[t, :] * scale, with causal mask: positions > i + (cur_len - s) masked.
+        unsafe {
+            let q_ptr = q.data.as_ptr().add(head_off);
+            gemm(
+                s, cur_len, hd,
+                scores.as_mut_ptr(), 1, cur_len as isize, false,
+                q_ptr, 1, tok_stride,          // q strided: lhs_cs=1, lhs_rs=tok_stride
+                k_head.as_ptr(), hd as isize, 1, // K as K^T: rhs_cs=hd, rhs_rs=1
+                0.0, 1.0, false, false, false,
+                Parallelism::None,
+            );
+        }
+        // scale + causal mask (masked → -inf so softmax zeroes them).
+        let offset = cur_len - s;
         for i in 0..s {
-            let qi = &q_qh[i * hd..(i + 1) * hd];
-            let limit = if causal { i + (cur_len - s) + 1 } else { cur_len };
-            for t in 0..cur_len {
-                if t >= limit {
-                    scores[i * cur_len + t] = f32::NEG_INFINITY;
-                } else {
-                    let kt = &k_cache[k_base + t * hd..k_base + (t + 1) * hd];
-                    let mut dot = 0.0f32;
-                    for j in 0..hd { dot += qi[j] * kt[j]; }
-                    scores[i * cur_len + t] = dot * scale;
-                }
+            let limit = if causal { i + offset + 1 } else { cur_len };
+            let row = &mut scores[i * cur_len..(i + 1) * cur_len];
+            for (t, cell) in row.iter_mut().enumerate() {
+                if t >= limit { *cell = f32::NEG_INFINITY; } else { *cell *= scale; }
             }
         }
-        // softmax per row
+        // softmax per row.
         for i in 0..s {
             let row = &mut scores[i * cur_len..(i + 1) * cur_len];
             let mut mx = f32::NEG_INFINITY;
@@ -788,27 +792,25 @@ fn prefill_attention(
             let inv = 1.0 / sum;
             for v in row.iter_mut() { *v *= inv; }
         }
-        // out[ib, i, qh, j] = sum_t scores[i, t] * V[t, j]
-        let out_ptr = out.as_ptr() as *mut f32;
-        for i in 0..s {
-            let dst_off = ((ib * s + i) * nqh + qh) * hd;
-            // SAFETY: each (ib, qh) writes a disjoint stride of slots; no overlap with other (ib', qh').
-            unsafe {
-                let out_i = std::slice::from_raw_parts_mut(out_ptr.add(dst_off), hd);
-                for j in 0..hd { out_i[j] = 0.0; }
-                let row = &scores[i * cur_len..(i + 1) * cur_len];
-                for t in 0..cur_len {
-                    let w = row[t];
-                    if w == 0.0 { continue; }
-                    let vt = &v_cache[v_base + t * hd..v_base + (t + 1) * hd];
-                    for j in 0..hd { out_i[j] += w * vt[j]; }
-                }
-            }
+        // out[ib,:,qh,:] = scores @ V_head  (written with per-token stride; no scatter).
+        // SAFETY: each (ib, qh) job writes disjoint strided rows of `out`; derived from a shared
+        // &out inside the closure so it stays Send (raw ptrs themselves are !Send).
+        unsafe {
+            let out_ptr = out.as_ptr() as *mut f32;
+            let dst = out_ptr.add(head_off);
+            gemm(
+                s, hd, cur_len,
+                dst, 1, tok_stride, false,        // out strided: dst_cs=1, dst_rs=tok_stride
+                scores.as_ptr(), 1, cur_len as isize,
+                v_head.as_ptr(), 1, hd as isize,  // V [cur_len,hd] standard: rhs_cs=1, rhs_rs=hd
+                0.0, 1.0, false, false, false,
+                Parallelism::None,
+            );
         }
     });
 
-    // Logical shape [b, nqh, s, hd] but actual bytes are [b, s, nqh, hd] — the caller knows
-    // to reshape to [b, s, nqh*hd] without swap_dims_12.
+    // Logical shape [b, nqh, s, hd] but actual bytes are [b, s, nqh, hd] — the caller reshapes
+    // to [b, s, nqh*hd] without swap_dims_12.
     CpuTensor::new(out, vec![b, nqh, s, hd])
 }
 
@@ -1085,6 +1087,61 @@ mod tests {
         for (s, a) in scalar.iter().zip(avx2.iter()) {
             assert!((s - a).abs() < 1e-3 * s.abs() + 1e-4,
                     "avx2 vs scalar: scalar={} avx2={}", s, a);
+        }
+    }
+
+    /// `prefill_attention` (gemm-crate path) must match a brute-force causal GQA reference.
+    /// Guards the strided q/out access, the K^T vs V rhs strides, causal mask, and softmax.
+    #[test]
+    fn prefill_attention_matches_reference() {
+        let b = 1; let nqh = 4; let nkvh = 2; let hd = 8;
+        let s = 3; let cur_len = 3; let max_seq = 4;
+        let n_rep = nqh / nkvh;
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        // q bytes [b, s, nqh, hd]; k/v cache [b, nkvh, max_seq, hd].
+        let q = CpuTensor::new(
+            (0..b * s * nqh * hd).map(|i| ((i as f32) * 0.13).sin()).collect(),
+            vec![b, nqh, s, hd],
+        );
+        let kv_len = b * nkvh * max_seq * hd;
+        let k_cache: Vec<f32> = (0..kv_len).map(|i| ((i as f32) * 0.17).cos()).collect();
+        let v_cache: Vec<f32> = (0..kv_len).map(|i| ((i as f32) * 0.11).sin()).collect();
+        let causal = true;
+        let out = prefill_attention(&q, &k_cache, &v_cache, b, nqh, nkvh, max_seq, hd, cur_len, causal);
+
+        let offset = cur_len - s;
+        for ib in 0..b {
+            for qh in 0..nqh {
+                let kh = qh / n_rep;
+                for i in 0..s {
+                    let limit = if causal { i + offset + 1 } else { cur_len };
+                    // scores[t] = (q · K[t]) * scale, masked → 0 weight.
+                    let mut scores = vec![0.0f32; cur_len];
+                    for t in 0..limit {
+                        let mut dot = 0.0f32;
+                        for j in 0..hd {
+                            dot += q.data[((ib * s + i) * nqh + qh) * hd + j]
+                                * k_cache[((ib * nkvh + kh) * max_seq + t) * hd + j];
+                        }
+                        scores[t] = dot * scale;
+                    }
+                    let mx = (0..limit).map(|t| scores[t]).fold(f32::NEG_INFINITY, f32::max);
+                    let mut sum = 0.0f32;
+                    for t in 0..limit { scores[t] = (scores[t] - mx).exp(); sum += scores[t]; }
+                    let inv = 1.0 / sum;
+                    for t in 0..limit { scores[t] *= inv; }
+                    for j in 0..hd {
+                        let mut acc = 0.0f32;
+                        for t in 0..limit {
+                            acc += scores[t] * v_cache[((ib * nkvh + kh) * max_seq + t) * hd + j];
+                        }
+                        let got = out.data[((ib * s + i) * nqh + qh) * hd + j];
+                        assert!((got - acc).abs() < 1e-4 * acc.abs() + 1e-5,
+                                "prefill_attn mismatch ib={} qh={} i={} j={}: got={} exp={}",
+                                ib, qh, i, j, got, acc);
+                    }
+                }
+            }
         }
     }
 }

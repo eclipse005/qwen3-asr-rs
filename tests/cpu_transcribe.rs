@@ -14,6 +14,11 @@ fn model_dir_06() -> String {
         .unwrap_or_else(|_| repo_root().join("models/Qwen3-ASR-0.6B").to_string_lossy().into_owned())
 }
 
+fn model_dir_17() -> String {
+    std::env::var("QWEN3_ASR_MODEL_17_DIR")
+        .unwrap_or_else(|_| repo_root().join("models/Qwen3-ASR-1.7B").to_string_lossy().into_owned())
+}
+
 fn fixture(name: &str) -> String {
     let base = std::env::var("QWEN3_ASR_FIXTURES_DIR")
         .map(PathBuf::from)
@@ -21,22 +26,78 @@ fn fixture(name: &str) -> String {
     base.join(name).to_string_lossy().into_owned()
 }
 
-fn run_cpu(name: &str, wav: &str, duration_s: f32) {
+fn run_cpu_with(name: &str, model_dir: &str, wav: &str, duration_s: f32, max_new_tokens: usize) {
+    // Default to warn so this is zero-noise unless RUST_LOG=qwen3_asr=info is set, in which case
+    // generate_cpu prints Prefill/Decode ms (and cpu_engine prints per-layer decode at step 100).
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .is_test(true).try_init();
+
     let backend = qwen3_asr::Backend::Cpu;
     let engine = qwen3_asr::AsrInference::load(
-        std::path::Path::new(&model_dir_06()), backend,
-    ).expect("load 0.6B CPU");
+        std::path::Path::new(model_dir), backend,
+    ).expect("load CPU");
 
     let t0 = Instant::now();
     let result = engine.transcribe(
         &fixture(wav),
-        qwen3_asr::TranscribeOptions::default(),
+        qwen3_asr::TranscribeOptions::default().with_max_new_tokens(max_new_tokens),
     ).expect("transcribe");
     let elapsed = t0.elapsed().as_secs_f32();
     let rtfx = if duration_s > 0.0 { format!("{:.2}x", duration_s / elapsed) } else { "—".to_string() };
+    // Peak working set of this process — OS-tracked PeakWorkingSetSize is the true peak over
+    // the whole run (load + prefill + decode), no polling miss.  Captured here so the baseline
+    // run reports RTFx + RSS in one shot instead of a separate measurement pass.
+    let mem = match peak_rss_mb() {
+        Some(m) => format!("{}MB", m),
+        None => "n/a".to_string(),
+    };
 
-    println!("CPU {} | {:.3}s elapsed | RTFx {} | {} | {}", name, elapsed, rtfx, result.language, result.text);
+    println!("CPU {} | {:.3}s elapsed | RTFx {} | RSS {} | {} | {}", name, elapsed, rtfx, mem, result.language, result.text);
     assert!(!result.text.is_empty(), "Transcription should not be empty");
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct ProcessMemoryCounters {
+    cb: u32,
+    page_fault_count: u32,
+    peak_working_set_size: usize,
+    working_set_size: usize,
+    quota_peak_paged_pool_usage: usize,
+    quota_paged_pool_usage: usize,
+    quota_peak_non_paged_pool_usage: usize,
+    quota_non_paged_pool_usage: usize,
+    pagefile_usage: usize,
+    peak_pagefile_usage: usize,
+}
+
+#[cfg(windows)]
+#[link(name = "psapi")]
+extern "system" {
+    fn GetProcessMemoryInfo(process: isize, counters: *mut ProcessMemoryCounters, cb: u32) -> i32;
+}
+
+/// Peak working set of this process in MiB via `GetProcessMemoryInfo` (psapi.dll, linked
+/// directly — no extra crate). OS-tracked PeakWorkingSetSize is the true peak over the whole
+/// run (load + prefill + decode), captured once after the workload.  Note: it is per-process
+/// and monotonic, so for a clean per-fixture number each fixture must run in its own process.
+#[cfg(windows)]
+fn peak_rss_mb() -> Option<u64> {
+    unsafe {
+        let mut pmc: ProcessMemoryCounters = std::mem::zeroed();
+        pmc.cb = std::mem::size_of::<ProcessMemoryCounters>() as u32;
+        if GetProcessMemoryInfo(-1isize, &mut pmc, pmc.cb) != 0 {
+            Some(pmc.peak_working_set_size as u64 / (1024 * 1024))
+        } else {
+            None
+        }
+    }
+}
+#[cfg(not(windows))]
+fn peak_rss_mb() -> Option<u64> { None }
+
+fn run_cpu(name: &str, wav: &str, duration_s: f32) {
+    run_cpu_with(name, &model_dir_06(), wav, duration_s, 512);
 }
 
 #[test] fn test_cpu_sample1()   { run_cpu("sample1",   "sample1.wav",   0.0); }
@@ -46,6 +107,18 @@ fn run_cpu(name: &str, wav: &str, duration_s: f32) {
 #[test] fn test_cpu_89s_ja()   { run_cpu("89s_ja",    "ja_89s.wav",   89.0); }
 #[test] fn test_cpu_180s()     { run_cpu("180s",      "180s.wav",    180.0); }
 #[test] fn test_cpu_180s_en()  { run_cpu("180s_en",   "180s_en.wav", 180.0); }
+
+// 1.7B CPU baseline — mirror CUDA test_q17_* config (long fixtures bump max_new_tokens to 1024).
+fn run_cpu_17(name: &str, wav: &str, duration_s: f32, max_new_tokens: usize) {
+    run_cpu_with(name, &model_dir_17(), wav, duration_s, max_new_tokens);
+}
+
+#[test] fn test_cpu_17_15s()     { run_cpu_17("1.7B-15s",     "15s.wav",      15.0,  512); }
+#[test] fn test_cpu_17_30s()     { run_cpu_17("1.7B-30s",     "30s.wav",      30.0,  512); }
+#[test] fn test_cpu_17_90s()     { run_cpu_17("1.7B-90s",     "90s.wav",      90.0, 1024); }
+#[test] fn test_cpu_17_89s_ja()  { run_cpu_17("1.7B-89s_ja",  "ja_89s.wav",   89.0, 1024); }
+#[test] fn test_cpu_17_180s()    { run_cpu_17("1.7B-180s",    "180s.wav",    180.0, 1024); }
+#[test] fn test_cpu_17_180s_en() { run_cpu_17("1.7B-180s_en", "180s_en.wav", 180.0, 1024); }
 
 /// Verify streaming produces identical final result as non-streaming.
 #[test]
