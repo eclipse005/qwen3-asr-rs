@@ -1,19 +1,13 @@
 # Measure peak working set of the cpu_transcribe test process for one fixture.
-# Usage: powershell -File mem_probe.ps1 <fixture> <envval: 1=default int8 | 0=f16>
+# Usage: powershell -File mem_probe.ps1 <fixture>
+# Note: in-process peak RSS is now reported directly by cpu_transcribe.rs (Win32
+# GetProcessMemoryInfo); this script is just a fallback external poller. INT8 is permanent.
 param(
-  [string]$fixture = "test_cpu_90s",
-  [string]$envval  = "1"
+  [string]$fixture = "test_cpu_90s"
 )
-if ($envval -eq "0") {
-  $env:QASR_CPU_INT8 = "0"
-  $label = "f16"
-} else {
-  Remove-Item Env:QASR_CPU_INT8 -ErrorAction SilentlyContinue
-  $label = "int8(default)"
-}
 $argStr = "test --release --no-default-features --features cpu --test cpu_transcribe $fixture -- --nocapture --test-threads=1"
 $p = Start-Process -FilePath cargo -ArgumentList $argStr -PassThru -WindowStyle Hidden `
-     -RedirectStandardOutput "$env:TEMP\mem_$label.out" -RedirectStandardError "$env:TEMP\mem_$label.err"
+     -RedirectStandardOutput "$env:TEMP\mem_$fixture.out" -RedirectStandardError "$env:TEMP\mem_$fixture.err"
 $max = 0L
 while (-not $p.HasExited) {
   Start-Sleep -Milliseconds 100
@@ -21,5 +15,5 @@ while (-not $p.HasExited) {
     if ($_.WorkingSet64 -gt $max) { $max = $_.WorkingSet64 }
   }
 }
-$rtfx = (Select-String -Path "$env:TEMP\mem_$label.out" -Pattern "RTFx\s+([\d.]+)x").Matches.Groups[1].Value
-"{0}  fixture={1}  peakRSS={2:N0} MB  RTFx={3}x" -f $label, $fixture, ($max/1MB), $rtfx
+$rtfx = (Select-String -Path "$env:TEMP\mem_$fixture.out" -Pattern "RTFx\s+([\d.]+)x").Matches.Groups[1].Value
+"fixture={0}  peakRSS={1:N0} MB  RTFx={2}x" -f $fixture, ($max/1MB), $rtfx

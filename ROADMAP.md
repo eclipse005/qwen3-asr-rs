@@ -201,12 +201,17 @@ decode loop（每步）：
 
 `gpu_audio_encoder.rs::GpuConvStem::forward` 的 `[b,c,f,t]→[b,t,c,f]` permute 现在走 GPU kernel `permute_bcft_to_btcf_f16`（kernels.cu:1275），无 CPU 绕路。曾是 CPU detour（~5-10ms），已消除。
 
-### 3.3 已知 dead code（rustc 警告）
+### 3.3 死代码清理状态（2026-06-13 全树复核）
 
-- `gpu_audio_encoder.rs::GpuAudioEncoder::run_transformer` — 保留，未来 streaming 入口
-- `inference.rs::AsrInferenceInner::tokenizer_decode` — 保留，debug/streaming 复用
-- `inference.rs::AsrInferenceInner::decode_result` — **不是 dead code**，rustc 误报
-- `raw_tensor.rs::to_f32_vec` / `as_f32` — CPU 路径改用 `as_f16()`，GPU 不用 f32，但保留作为工具方法
+原先标注的"死代码"经核查大多其实在用：
+- `gpu_audio_encoder.rs::GpuAudioEncoder::run_transformer` — **在用**（streaming.rs 4 处调用），非死代码。
+- `prompt::decode_result` — **在用**（inference.rs / streaming.rs 调用）。原条目标"inference.rs::AsrInferenceInner::decode_result"路径过时，实际在 prompt.rs。
+- `raw_tensor.rs::to_f32_vec` / `as_f32` — **在用**（CPU 路径 `load_vec_f32 → as_f32` 读 f32 的 layernorm/bias 权重）。原"CPU 改用 as_f16"说法不准，as_f32 仍用于 f32 权重。
+- `inference.rs::tokenizer_decode` — **已不存在**（早被删，原条目过时）。
+- **已删（2026-06-13）**：`lm_head_argmax`（cudarc_engine.rs）+ 其 kernel `lm_head_gemv_argmax_f16`（kernels.cu）+ CudaKernels 字段/load —— 0 调用方，融合收益 ~0.1%（见 §5.1 分析），移除。
+- **已删（2026-06-13）**：`mem_probe.ps1` 的 `QASR_CPU_INT8`/f16 死分支（INT8 永久无开关），脚本简化为纯 RSS 轮询。
+
+其余 `#[allow(dead_code)]`（~11 处，在 CpuKvCache/CudaKernels/DecodeScratch/GpuConvStem 等结构体上）是结构体个别未用字段（加载/scratch 完整保留），非整项死代码，保留。
 
 ### 3.4 streaming API
 
@@ -281,7 +286,7 @@ kernel 存在（`lm_head_gemv_argmax_f16`）但注释说"目前输给 cuBLAS"，
 - **CPU 解码器 body 永久 INT8**（per-channel 对称 + AVX2 GEMV，`is_x86_feature_detected!` 分发）。4 个 decoder linear 在 `CpuDecoderLayer::load` 时从 f16 量化成 `CpuWeightI8`；lm_head/embed_table/音频编码器仍 f16（`linear_gemv_f16`）。无开关、无 f16 回退分支。INT8 是**提速**优化，**不减峰值内存**（prefill 仍反量化 f32）。
 - **AVX-VNNI 在本开发 VM 是 CPUID 假阳性**（`is_x86_feature_detected!("avxvnni")` 返回 true，但执行 `_mm256_dpbusd_epi32` 直接 `STATUS_ILLEGAL_INSTRUCTION` —— hypervisor 透传了 VNNI 标志位但不支持执行）。所以 CPU INT8 GEMV 只用 AVX2 `madd` 路径，**不要尝试 VNNI**（曾试过，崩；代码已还原）。真实 Arrow Lake 硬件上 VNNI 理论可用但本环境无法验证。decode GEMV 的进一步提速需等真实 VNNI 硬件或换思路（如 KV cache f16 / 投机解码）。
 - **本 VM 持续负载热降频严重**：cross-run 的 total RTFx 噪声大（连续跑会越跑越慢）。要测 total RTFx 须凉机单跑；**进程内直接计时（如 generate_cpu 的 `info!("Prefill/Decode ms")`、cpu_engine 的采样 pmark）不受热噪声影响，是可靠信号**。
-- **CER 对照工具**：`examples/cer_compare.rs`（解析两次 transcribe stdout 算 raw + 归一化 CER）。峰值 RSS 已折进 `cpu_transcribe.rs::run_cpu_with`（in-process Win32 `GetProcessMemoryInfo`，每 fixture 独立进程）；`examples/mem_probe.ps1` 是旧的 100ms 轮询版（其 `QASR_CPU_INT8` 开关是死代码——INT8 永久，无开关），已被取代。
+- **CER 对照工具**：`examples/cer_compare.rs`（解析两次 transcribe stdout 算 raw + 归一化 CER）。峰值 RSS 已折进 `cpu_transcribe.rs::run_cpu_with`（in-process Win32 `GetProcessMemoryInfo`，每 fixture 独立进程，优先用这个）；`examples/mem_probe.ps1` 是 100ms 外部轮询的 fallback（死掉的 `QASR_CPU_INT8` 开关于 2026-06-13 移除，INT8 永久）。
 
 ## 7. 给接手 AI 的具体操作
 

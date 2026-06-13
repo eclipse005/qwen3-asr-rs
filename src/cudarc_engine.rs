@@ -85,7 +85,6 @@ pub(crate) struct CudaKernels {
     pub embed_lookup_single_i32: CudaFunction,
     pub argmax: CudaFunction,
     pub argmax_into_slot: CudaFunction,
-    pub lm_head_gemv_argmax: CudaFunction,
     pub swap_dims_12: CudaFunction,
     pub qkv_split: CudaFunction,
     pub qkv_extract_q_norm_rotary: CudaFunction,
@@ -165,7 +164,6 @@ impl CudaState {
             embed_lookup_single_i32: module.load_function("embed_lookup_single_i32_f16")?,
             argmax: module.load_function("argmax_f16")?,
             argmax_into_slot: module.load_function("argmax_into_slot_f16")?,
-            lm_head_gemv_argmax: module.load_function("lm_head_gemv_argmax_f16")?,
             swap_dims_12: module.load_function("swap_dims_12_f16")?,
             qkv_split: module.load_function("qkv_split_f16")?,
             qkv_extract_q_norm_rotary: module.load_function("qkv_extract_q_norm_rotary_f16")?,
@@ -582,29 +580,6 @@ impl CudaState {
         bb.arg(token_buf); bb.arg(x); bb.arg(&n_i); bb.arg(&slot_i);
         unsafe { bb.launch(cfg) }?;
         Ok(())
-    }
-
-    /// Fused: y = hidden @ embed_table^T, then argmax(y).  Saves one alloc + one launch
-    /// vs separate `linear_gpu + argmax`, but our hand-written GEMV currently loses to cuBLAS
-    /// f16 GEMV on vocab-size 151936 by a large margin — kept for reference / future fusion work.
-    /// hidden: at least [hs] elements; embed_table: [vocab, hs] GpuWeight.
-    pub fn lm_head_argmax(&self, hidden: &GpuTensor, embed_table: &GpuWeight) -> Result<i32> {
-        let hs = embed_table.cols;
-        let vocab = embed_table.rows;
-        assert!(hidden.numel() >= hs, "lm_head_argmax: hidden too small");
-        let mut out = self.alloc_uninit_i32(1)?;
-        let cfg = LaunchConfig {
-            grid_dim: (1, 1, 1),
-            block_dim: (1024, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let v_i = vocab as i32; let hs_i = hs as i32;
-        let mut bb = self.stream.launch_builder(&self.k.lm_head_gemv_argmax);
-        bb.arg(&mut out); bb.arg(&hidden.data); bb.arg(&embed_table.data);
-        bb.arg(&v_i); bb.arg(&hs_i);
-        unsafe { bb.launch(cfg) }?;
-        let v = self.download_i32(&out)?;
-        Ok(v[0])
     }
 
     pub fn swap_dims_12(&self, x: &GpuTensor) -> Result<GpuTensor> {

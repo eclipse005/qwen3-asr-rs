@@ -403,57 +403,6 @@ embed_lookup_single_i32_f16(
     }
 }
 
-// ─── Fused LM-head GEMV + argmax (decode-only) ─────────────────────
-// hidden: [1, 1, hs]   embed_table: [vocab, hs]  (acts as lm_head weight; y = hidden @ embed_table^T)
-// Computes logits = hidden @ embed_table^T (length vocab), tracks argmax inline.
-// Output: a single i32 (the argmax index).
-//
-// Grid = (BLOCKS,) blocks; each block computes a slab of `vocab / BLOCKS` rows,
-// reduces local max within the block, then writes (max, idx) to a temp [BLOCKS] pair.
-// A small reduction kernel picks the global argmax.
-//
-// For simplicity we go single-pass: launch ONE block with grid=1 and lots of threads,
-// each thread covers a stripe of vocab rows. cur GPU (P104, sm_61) can handle this fine
-// because vocab~151936 / 1024 threads = ~148 dot-products per thread, each 1024 multiplies.
-// Total ~152M ops per token, ~5ms on f16 — acceptable, saves alloc + launch overhead.
-extern "C" __global__ void __launch_bounds__(1024, 1)
-lm_head_gemv_argmax_f16(
-    int* __restrict__ out_idx,
-    const __half* __restrict__ hidden,      // [hs]
-    const __half* __restrict__ embed_table, // [vocab, hs]   row-major
-    int vocab, int hs
-) {
-    int tid = threadIdx.x;
-    int bs = blockDim.x;
-
-    float local_max = -INFINITY;
-    int local_idx = 0;
-    for (int v = tid; v < vocab; v += bs) {
-        float dot = 0.0f;
-        const __half* row = embed_table + v * hs;
-        for (int j = 0; j < hs; j++) {
-            dot += __half2float(hidden[j]) * __half2float(row[j]);
-        }
-        if (dot > local_max) { local_max = dot; local_idx = v; }
-    }
-
-    __shared__ float smax[1024];
-    __shared__ int sidx[1024];
-    smax[tid] = local_max;
-    sidx[tid] = local_idx;
-    __syncthreads();
-    for (int s = bs >> 1; s > 0; s >>= 1) {
-        if (tid < s) {
-            if (smax[tid + s] > smax[tid]) {
-                smax[tid] = smax[tid + s];
-                sidx[tid] = sidx[tid + s];
-            }
-        }
-        __syncthreads();
-    }
-    if (tid == 0) *out_idx = sidx[0];
-}
-
 // ─── Argmax over a vector of length n (single block) ───────────────
 extern "C" __global__ void __launch_bounds__(1024, 1)
 argmax_f16(
