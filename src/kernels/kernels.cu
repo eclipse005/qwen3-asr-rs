@@ -10,6 +10,7 @@
 
 // ─── RMS norm: x [outer, last] * weight[last] → out, with f32 accumulation ──
 // One block per row; block_size threads cooperate over `last`.
+// Uses __half2 vectorized loads for 2x memory throughput.
 // Shared mem: block_size * sizeof(float).
 extern "C" __global__ void __launch_bounds__(1024, 2)
 rms_norm_f16(
@@ -27,9 +28,19 @@ rms_norm_f16(
 
     extern __shared__ float sdata[];
 
+    int last2 = last / 2;
+    const __half2* x2 = (const __half2*)(x + row * last);
+    const __half2* w2 = (const __half2*)w;
+
     float local = 0.0f;
-    for (int j = tid; j < last; j += bs) {
-        float v = __half2float(x[row * last + j]);
+    for (int j = tid; j < last2; j += bs) {
+        __half2 v = x2[j];
+        float vx = __half2float(v.x), vy = __half2float(v.y);
+        local += vx * vx + vy * vy;
+    }
+    if (last & 1) {
+        // Handle odd trailing element (unlikely for model dims but safe)
+        float v = __half2float(x[row * last + last - 1]);
         local += v * v;
     }
     sdata[tid] = local;
@@ -41,9 +52,17 @@ rms_norm_f16(
     }
     float inv_rms = rsqrtf(sdata[0] / (float)last + eps);
 
-    for (int j = tid; j < last; j += bs) {
-        float v = __half2float(x[row * last + j]) * inv_rms * __half2float(w[j]);
-        out[row * last + j] = __float2half(v);
+    __half2* o2 = (__half2*)(out + row * last);
+    for (int j = tid; j < last2; j += bs) {
+        __half2 xv = x2[j];
+        __half2 wv = w2[j];
+        float vx = __half2float(xv.x) * inv_rms * __half2float(wv.x);
+        float vy = __half2float(xv.y) * inv_rms * __half2float(wv.y);
+        o2[j] = __halves2half2(__float2half(vx), __float2half(vy));
+    }
+    if (last & 1) {
+        float v = __half2float(x[row * last + last - 1]) * inv_rms * __half2float(w[last - 1]);
+        out[row * last + last - 1] = __float2half(v);
     }
 }
 
@@ -133,7 +152,7 @@ silu_mul_f16(
 
 // ─── Fused gate-up split + SiLU(gate)*up ──────────────────────────
 // gu: [outer, 2*inter] in row-major (gate first half of last dim, up second half).
-// Writes activated [outer, inter].
+// Writes activated [outer, inter]. Uses __half2 vectorized loads.
 extern "C" __global__ void __launch_bounds__(1024, 2)
 silu_mul_split_f16(
     __half* __restrict__ out,
@@ -141,15 +160,30 @@ silu_mul_split_f16(
     int outer,
     int inter
 ) {
+    int inter2 = inter / 2;
+    int total2 = outer * inter2;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= outer * inter) return;
-    int o = i / inter;
-    int c = i % inter;
+    if (i >= total2) return;
+    int o = i / inter2;
+    int c = i % inter2;
     int base = o * 2 * inter;
-    float g = __half2float(gu[base + c]);
-    float u = __half2float(gu[base + inter + c]);
-    float sig = 1.0f / (1.0f + expf(-g));
-    out[i] = __float2half(g * sig * u);
+    const __half2* g2 = (const __half2*)(gu + base);
+    const __half2* u2 = (const __half2*)(gu + base + inter);
+    __half2 gv = g2[c];
+    __half2 uv = u2[c];
+    float gx = __half2float(gv.x), gy = __half2float(gv.y);
+    float ux = __half2float(uv.x), uy = __half2float(uv.y);
+    float sx = 1.0f / (1.0f + __expf(-gx));
+    float sy = 1.0f / (1.0f + __expf(-gy));
+    ((__half2*)out)[i] = __halves2half2(__float2half(gx * sx * ux), __float2half(gy * sy * uy));
+    if (inter & 1 && i == 0) {
+        // Handle odd trailing element
+        int last_c = inter - 1;
+        float g = __half2float(gu[base + last_c]);
+        float u = __half2float(gu[base + inter + last_c]);
+        float sig = 1.0f / (1.0f + __expf(-g));
+        out[o * inter + last_c] = __float2half(g * sig * u);
+    }
 }
 
 // ─── Softmax with scale + optional causal mask ─────────────────────
@@ -439,8 +473,7 @@ argmax_f16(
 }
 
 // Same as argmax_f16 but writes into out_idx[slot] instead of out_idx[0].
-// Lets the decode loop reuse a single i32 buffer across all steps and chain
-// the result into embed_lookup_single_i32_f16 without an htod round-trip.
+// Uses __half2 vectorized loads for 2x memory throughput.
 extern "C" __global__ void __launch_bounds__(1024, 1)
 argmax_into_slot_f16(
     int* __restrict__ out_idx,
@@ -453,11 +486,22 @@ argmax_into_slot_f16(
     __shared__ float smax[1024];
     __shared__ int sidx[1024];
 
+    int n2 = n / 2;
+    const __half2* x2 = (const __half2*)x;
+
     float local_max = -INFINITY;
     int local_idx = 0;
-    for (int i = tid; i < n; i += bs) {
-        float v = __half2float(x[i]);
-        if (v > local_max) { local_max = v; local_idx = i; }
+    for (int i = tid; i < n2; i += bs) {
+        __half2 v = x2[i];
+        float vx = __half2float(v.x);
+        float vy = __half2float(v.y);
+        int ix = i * 2;
+        if (vx > local_max) { local_max = vx; local_idx = ix; }
+        if (vy > local_max) { local_max = vy; local_idx = ix + 1; }
+    }
+    if ((n & 1) && tid == 0) {
+        float v = __half2float(x[n - 1]);
+        if (v > local_max) { local_max = v; local_idx = n - 1; }
     }
     smax[tid] = local_max;
     sidx[tid] = local_idx;
@@ -954,7 +998,7 @@ fused_gqa_decode_f16(
 // Phase 2: each block handles one (b, nqh) — reads N chunks of (max, sum, partial_out),
 // merges with online-softmax correction, writes final out.
 
-extern "C" __global__ void
+extern "C" __global__ void __launch_bounds__(256, 4)
 fused_gqa_decode_split_p1_f16(
     float* __restrict__ part_out,       // [b, nqh, NCHUNKS, d]   (float for accumulation)
     float* __restrict__ part_max,       // [b, nqh, NCHUNKS]
@@ -1208,4 +1252,52 @@ conv_postprocess_f16(
     // GELU
     float g = 0.5f * v * (1.0f + erff(v * 0.70710678118654752440f));
     out[tot] = __float2half(g);
+}
+
+// ─── Permute [b, c, f, t] → [b, t, c, f] ──────────────────────────────
+// Each thread copies one element. Grid covers b*t*c*f total elements.
+extern "C" __global__ void __launch_bounds__(512, 4)
+permute_bcft_to_btcf_f16(
+    __half* __restrict__ dst,
+    const __half* __restrict__ src,
+    int b, int c, int f, int t
+) {
+    int tot = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = b * c * f * t;
+    if (tot >= total) return;
+
+    // Decompose linear index into (ib, ic, if_, it) in source layout [b,c,f,t]
+    int it = tot % t;
+    int rem = tot / t;
+    int if_ = rem % f;
+    rem /= f;
+    int ic = rem % c;
+    int ib = rem / c;
+
+    // Destination layout [b, t, c, f]
+    int dst_idx = ((ib * t + it) * c + ic) * f + if_;
+    dst[dst_idx] = src[tot];
+}
+
+// ─── Broadcast PE add: out[b, t, d] = x[b, t, d] + pe[t, d] ──────────
+// Grid: (b*t, 1, 1), Block: min(d, 1024), shared mem: block_size * sizeof(float)
+extern "C" __global__ void __launch_bounds__(512, 4)
+add_pe_f16(
+    __half* __restrict__ out,
+    const __half* __restrict__ x,
+    const __half* __restrict__ pe,
+    int d,       // d_model
+    int t,       // t2 (number of time steps actually used)
+    int bt       // b * t2 total rows
+) {
+    int row = blockIdx.x;
+    if (row >= bt) return;
+    int tid = threadIdx.x;
+    int bs = blockDim.x;
+    int t_step = row % t;  // which time step (for PE lookup)
+
+    for (int j = tid; j < d; j += bs) {
+        float v = __half2float(x[row * d + j]) + __half2float(pe[t_step * d + j]);
+        out[row * d + j] = __float2half(v);
+    }
 }

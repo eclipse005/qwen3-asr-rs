@@ -28,7 +28,7 @@ const KERNEL_SRC: &str = include_str!("kernels/kernels.cu");
 // ═══════════════════════════════════════════════════════════════════════
 
 pub(crate) struct GpuTensor {
-    data: CudaSlice<f16>,
+    pub(crate) data: CudaSlice<f16>,
     shape: Vec<usize>,
 }
 
@@ -104,6 +104,8 @@ pub(crate) struct CudaKernels {
     pub fused_gqa_decode: CudaFunction,
     pub fused_gqa_decode_split_p1: CudaFunction,
     pub fused_gqa_decode_split_p2: CudaFunction,
+    pub permute_bcft_to_btcf: CudaFunction,
+    pub add_pe: CudaFunction,
 }
 
 pub(crate) struct CudaState {
@@ -125,12 +127,21 @@ impl CudaState {
         let stream = ctx.default_stream();
         let blas = CudaBlas::new(stream.clone())?;
 
-        // CUDA toolkit include for cuda_fp16.h
+        // Enable Tensor Core math mode — no-op on Pascal, ensures TC usage on Ampere+
+        unsafe {
+            sys::cublasSetMathMode(*blas.handle(), sys::cublasMath_t::CUBLAS_TENSOR_OP_MATH);
+        }
+
+        // NVRTC: target native arch for better codegen
         let cuda_include = std::env::var("CUDA_PATH")
             .map(|p| format!("{}/include", p))
             .unwrap_or_else(|_| "/usr/local/cuda/include".to_string());
+        // Leak the arch string — this runs once at init, ~20 bytes is negligible.
+        let arch: Option<&'static str> = ctx.compute_capability().ok().map(|(major, minor)| {
+            &*Box::leak(format!("sm_{}{}", major, minor).into_boxed_str())
+        });
         let opts = CompileOptions {
-            arch: None,
+            arch,
             include_paths: vec![cuda_include],
             ..Default::default()
         };
@@ -172,6 +183,8 @@ impl CudaState {
             fused_gqa_decode: module.load_function("fused_gqa_decode_f16")?,
             fused_gqa_decode_split_p1: module.load_function("fused_gqa_decode_split_p1_f16")?,
             fused_gqa_decode_split_p2: module.load_function("fused_gqa_decode_split_p2_f16")?,
+            permute_bcft_to_btcf: module.load_function("permute_bcft_to_btcf_f16")?,
+            add_pe: module.load_function("add_pe_f16")?,
         };
 
         Ok(Self { stream, blas, k })

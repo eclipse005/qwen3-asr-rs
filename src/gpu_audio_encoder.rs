@@ -10,7 +10,7 @@
 //! through CPU — see ROADMAP.md §3.3 for the planned GPU permute kernel.
 
 use anyhow::Result;
-use cudarc::driver::CudaSlice;
+use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 use half::f16;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -247,43 +247,41 @@ impl GpuConvStem {
         let s = x.shape();
         let (b2, c2_dim, f2, t2) = (s[0], s[1], s[2], s[3]);
 
-        // Permute [b, c, f, t] → [b, t, c, f] → reshape [b, t, c*f]
-        // We use a single swap_dims_12 doesn't fit here; do via download for now since
-        // it's small (~31×16×13×480 bytes).  TODO: write permute kernel.
-        let x_cpu = cuda.download_tensor(&x)?;
-        let mut perm = vec![f16::ZERO; b2 * t2 * c2_dim * f2];
-        for ib in 0..b2 {
-            for it in 0..t2 {
-                for ic in 0..c2_dim {
-                    for f in 0..f2 {
-                        let src = ((ib * c2_dim + ic) * f2 + f) * t2 + it;
-                        let dst = ((ib * t2 + it) * c2_dim + ic) * f2 + f;
-                        perm[dst] = x_cpu.data[src];
-                    }
-                }
-            }
+        // GPU permute [b, c, f, t] → [b, t, c, f], then reshape [b, t, c*f]
+        let numel = x.numel();
+        let mut perm_buf = cuda.alloc_uninit_f16(numel)?;
+        {
+            let cfg = LaunchConfig {
+                grid_dim: (((numel as u32) + 255) / 256, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let b_i = b2 as i32; let c_i = c2_dim as i32; let f_i = f2 as i32; let t_i = t2 as i32;
+            let mut bb = cuda.stream.launch_builder(&cuda.k.permute_bcft_to_btcf);
+            bb.arg(&mut perm_buf); bb.arg(&x.data);
+            bb.arg(&b_i); bb.arg(&c_i); bb.arg(&f_i); bb.arg(&t_i);
+            unsafe { bb.launch(cfg) }?;
         }
-        let r = cuda.upload_tensor(&CpuTensor::new(perm, vec![b2, t2, c2_dim * f2]))?;
-        let co = self.co.forward(cuda, &r)?;
-        // co: [b2, t2, d_model] — add PE [t2, d_model] broadcast over b2
-        // We do this on CPU since t2 is small and we need to slice/concat after anyway.
-        let co_cpu = cuda.download_tensor(&co)?;
-        let pe_cpu = cuda.stream.clone_dtoh(&self.pe)?;
-        let dm = self.d_model;
-        let mut out = co_cpu.data.clone();
-        for ib in 0..b2 {
-            for it in 0..t2 {
-                let base = (ib * t2 + it) * dm;
-                let pe_base = it * dm;
-                for j in 0..dm {
-                    let v = f32::from(out[base + j]) + f32::from(pe_cpu[pe_base + j]);
-                    out[base + j] = f16::from_f32(v);
-                }
-            }
-        }
+        let r = GpuTensor::new(perm_buf, vec![b2, t2, c2_dim * f2]);
 
+        // Linear projection on GPU
+        let co = self.co.forward(cuda, &r)?;
+
+        // GPU broadcast PE add: out[b, t, d] = co[b, t, d] + pe[t, d]
+        let dm = self.d_model;
+        let bt = b2 * t2;
+        let mut out_buf = cuda.alloc_uninit_f16(bt * dm)?;
+        {
+            let block = std::cmp::min(dm, 512) as u32;
+            let cfg = LaunchConfig { grid_dim: (bt as u32, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 };
+            let dm_i = dm as i32; let t2_i = t2 as i32; let bt_i = bt as i32;
+            let mut bb = cuda.stream.launch_builder(&cuda.k.add_pe);
+            bb.arg(&mut out_buf); bb.arg(&co.data); bb.arg(&self.pe);
+            bb.arg(&dm_i); bb.arg(&t2_i); bb.arg(&bt_i);
+            unsafe { bb.launch(cfg) }?;
+        }
+        let final_gpu = GpuTensor::new(out_buf, vec![b2, t2, dm]);
         let _ = self.max_pos;
-        let final_gpu = cuda.upload_tensor(&CpuTensor::new(out, vec![b2, t2, dm]))?;
         Ok((final_gpu, t2))
     }
 }

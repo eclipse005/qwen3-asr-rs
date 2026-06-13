@@ -86,21 +86,23 @@ pub struct AsrInference {
 
 impl AsrInference {
     pub fn load(model_dir: &Path, backend: Backend) -> crate::Result<Self> {
+        let t0 = std::time::Instant::now();
         info!("Loading config...");
         let config = AsrConfig::from_file(&model_dir.join("config.json"))
             .context("load config").map_err(AsrError::ModelLoad)?;
 
         info!("Loading weights...");
+        let t_weights = std::time::Instant::now();
         let weight_data = crate::weights::load_weights(model_dir)
             .context("load weights").map_err(AsrError::ModelLoad)?;
-        info!("Loaded {} weight tensors", weight_data.len());
+        info!("Loaded {} weight tensors in {:.1}ms", weight_data.len(), t_weights.elapsed().as_secs_f64() * 1000.0);
 
         info!("Loading tokenizer...");
         let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .map_err(|e| anyhow::anyhow!("tokenizer load failed: {}", e))
             .map_err(AsrError::ModelLoad)?;
 
-        info!("Model loaded successfully.");
+        info!("Total load+build: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
         Self::build_engine(config, weight_data, tokenizer, backend).map_err(AsrError::ModelLoad)
     }
 
@@ -131,25 +133,33 @@ impl AsrInference {
         let engine = match resolved {
             ResolvedBackend::Cpu => {
                 info!("Loading text decoder (CPU gemm+rayon engine)...");
+                let t1 = std::time::Instant::now();
                 let decoder = CpuTextDecoder::load(
                     &weights, "thinker.model", &config.thinker_config.text_config,
                 ).context("load CPU text decoder")?;
+                info!("CPU decoder loaded in {:.1}ms", t1.elapsed().as_secs_f64() * 1000.0);
                 info!("Loading audio encoder (CPU f32 engine)...");
+                let t2 = std::time::Instant::now();
                 let audio_encoder = CpuAudioEncoder::load(
                     &weights, "thinker.audio_tower", &config.thinker_config.audio_config,
                 ).context("load CPU audio encoder")?;
+                info!("CPU audio encoder loaded in {:.1}ms", t2.elapsed().as_secs_f64() * 1000.0);
                 Engine::Cpu { decoder, audio_encoder }
             }
             #[cfg(feature = "cuda")]
             ResolvedBackend::Cuda(cuda) => {
                 info!("Loading text decoder (GPU-resident cuBLAS+kernels)...");
+                let t1 = std::time::Instant::now();
                 let decoder = GpuTextDecoder::load_with(
                     cuda.clone(), &weights, "thinker.model", &config.thinker_config.text_config,
                 ).context("load GPU text decoder")?;
+                info!("GPU decoder loaded in {:.1}ms", t1.elapsed().as_secs_f64() * 1000.0);
                 info!("Loading audio encoder transformer (cuBLAS+kernels)...");
+                let t2 = std::time::Instant::now();
                 let audio_encoder = GpuAudioEncoder::load(
                     cuda.clone(), &weights, "thinker.audio_tower", &config.thinker_config.audio_config,
                 ).context("load GPU audio encoder")?;
+                info!("GPU audio encoder loaded in {:.1}ms", t2.elapsed().as_secs_f64() * 1000.0);
                 Engine::Cuda { cuda, decoder, audio_encoder }
             }
         };
