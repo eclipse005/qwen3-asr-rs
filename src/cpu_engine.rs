@@ -66,12 +66,100 @@ impl CpuWeightF16 {
         let data: Vec<f32> = self.data.iter().map(|v| v.to_f32()).collect();
         CpuWeight { data, rows: self.rows, cols: self.cols }
     }
+}
 
-    /// Rayon f16→f32. Better for few large calls (text decoder prefill).
-    fn to_f32_weight(&self) -> CpuWeight {
-        let data: Vec<f32> = self.data.par_iter().map(|v| v.to_f32()).collect();
-        CpuWeight { data, rows: self.rows, cols: self.cols }
+/// Weight matrix stored as **per-channel symmetric INT8**: `scale[i] = max(|w_row_i|)/127`,
+/// `data[i,j] ∈ [-127,127]`.  Halved memory vs f16, and (on AVX2) a 4× wider SIMD dot
+/// product — the decode-path win.  `cols` is padded up to a multiple of 32 (zero-filled)
+/// so the GEMV kernel is branch-free.
+pub(crate) struct CpuWeightI8 {
+    pub data: Vec<i8>,     // [rows, cols] row-major, cols padded to multiple of 32
+    pub scale: Vec<f32>,   // [rows] per-output-row symmetric scale
+    pub rows: usize,       // = N (out features)
+    pub cols: usize,       // padded K (in features)
+}
+
+impl CpuWeightI8 {
+    /// Per-channel symmetric quantisation from an f16 weight. Each output row gets its own
+    /// scale = max(|row|)/127; values clipped to [-127,127] (using /127, not /128, so two
+    /// quantised values multiply to ≤16129 — stays in i16 without saturation).  `cols` is
+    /// padded to a multiple of 32 with zeros.
+    pub(crate) fn from_f16(w: &CpuWeightF16) -> Self {
+        let rows = w.rows;
+        let k = w.cols;
+        let kpad = (k + 31) / 32 * 32;
+        let mut data = vec![0i8; rows * kpad];
+        let mut scale = vec![0.0f32; rows];
+        for i in 0..rows {
+            let src = &w.data[i * k..(i + 1) * k];
+            // Pass 1: per-row max abs.
+            let mut amax = 0.0f32;
+            for v in src { let a = v.to_f32().abs(); if a > amax { amax = a; } }
+            let s = amax / 127.0;
+            scale[i] = s;
+            let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
+            // Pass 2: quantise + clip into the padded row (tail [k..kpad] stays zero).
+            let dst = &mut data[i * kpad..(i + 1) * kpad];
+            for j in 0..k {
+                dst[j] = (src[j].to_f32() * inv).round().clamp(-127.0, 127.0) as i8;
+            }
+        }
+        CpuWeightI8 { data, scale, rows, cols: kpad }
     }
+
+    /// Dequantise to a real-k f32 weight for the prefill GEMM path (drops the 32-padding so
+    /// the returned `CpuWeight` matches the f16 path's shape).  Rayon over rows.  One-time
+    /// per transcribe call (prefill runs once).
+    pub(crate) fn dequant_to_f32(&self, real_k: usize) -> CpuWeight {
+        debug_assert!(real_k <= self.cols);
+        let kpad = self.cols;
+        let data: Vec<f32> = (0..self.rows).into_par_iter().flat_map_iter(|i| {
+            let s = self.scale[i];
+            let row = &self.data[i * kpad..i * kpad + real_k];
+            row.iter().map(move |&q| q as f32 * s)
+        }).collect();
+        CpuWeight { data, rows: self.rows, cols: real_k }
+    }
+}
+
+/// Decoder linear over an INT8 weight.  Decode (m=1) reads the INT8 weight directly (AVX2
+/// GEMV); prefill (m>1) dequantises to f32 for the gemm crate.  The decoder body is permanently
+/// INT8 — `lm_head` / `embed_table` / the audio encoder stay f16 via `linear_gemv_f16`.
+fn linear_i8(x: &CpuTensor, w: &CpuWeightI8) -> CpuTensor {
+    let nd = x.shape.len();
+    let m: usize = x.shape[..nd - 1].iter().product();
+    let k = x.shape[nd - 1];
+    let n = w.rows;
+    assert!(w.cols >= k && w.cols % 32 == 0,
+            "linear I8 K mismatch: x last={} vs W padded cols={}", k, w.cols);
+    let mut out_shape = x.shape.clone();
+    out_shape[nd - 1] = n;
+    if m == 1 {
+        let out = linear_gemv_i8(&x.data, w);
+        return CpuTensor::new(out, out_shape);
+    }
+    let w_f32 = w.dequant_to_f32(k);
+    let mut out = vec![0.0f32; m * n];
+    gemm_row_major(&mut out, &x.data, &w_f32, m, 0.0);
+    CpuTensor::new(out, out_shape)
+}
+
+/// `linear_i8` with a residual add (`out += result`).  Decode (m=1) computes a fresh GEMV then
+/// a scalar `+=`; prefill folds the residual via `gemm` beta=1.0.
+fn linear_accum_i8(out: &mut CpuTensor, x: &CpuTensor, w: &CpuWeightI8) {
+    let nd = x.shape.len();
+    let m: usize = x.shape[..nd - 1].iter().product();
+    let k = x.shape[nd - 1];
+    let n = w.rows;
+    assert!(w.cols >= k && w.cols % 32 == 0);
+    assert_eq!(out.numel(), m * n);
+    if m == 1 {
+        let add = linear_gemv_i8(&x.data, w);
+        for (o, a) in out.data.iter_mut().zip(add.iter()) { *o += *a; }
+        return;
+    }
+    let w_f32 = w.dequant_to_f32(k);
+    gemm_row_major(&mut out.data, &x.data, &w_f32, m, 1.0);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -101,45 +189,6 @@ pub(crate) fn linear(x: &CpuTensor, w: &CpuWeight) -> CpuTensor {
     let mut out = vec![0.0f32; m * n];
     gemm_row_major(&mut out, &x.data, w, m, 0.0);
     CpuTensor::new(out, out_shape)
-}
-
-// ─── f16-weight variants (decode: direct f16 read; prefill: convert to f32) ────
-
-/// `linear()` for f16 weights. Decode (m=1) reads f16 directly; prefill converts to f32.
-fn linear_f16(x: &CpuTensor, w: &CpuWeightF16) -> CpuTensor {
-    let nd = x.shape.len();
-    let m: usize = x.shape[..nd - 1].iter().product();
-    let k = x.shape[nd - 1];
-    let n = w.rows;
-    assert_eq!(k, w.cols, "linear_f16 K mismatch: x last={} vs W cols={}", k, w.cols);
-    let mut out_shape = x.shape.clone();
-    out_shape[nd - 1] = n;
-    if m == 1 {
-        let out = linear_gemv_f16(&x.data, w);
-        return CpuTensor::new(out, out_shape);
-    }
-    // Prefill: convert f16 → f32 for gemm crate.
-    let w_f32 = w.to_f32_weight();
-    let mut out = vec![0.0f32; m * n];
-    gemm_row_major(&mut out, &x.data, &w_f32, m, 0.0);
-    CpuTensor::new(out, out_shape)
-}
-
-/// `linear_accum()` for f16 weights.
-fn linear_accum_f16(out: &mut CpuTensor, x: &CpuTensor, w: &CpuWeightF16) {
-    let nd = x.shape.len();
-    let m: usize = x.shape[..nd - 1].iter().product();
-    let k = x.shape[nd - 1];
-    let n = w.rows;
-    assert_eq!(k, w.cols);
-    assert_eq!(out.numel(), m * n);
-    if m == 1 {
-        let add = linear_gemv_f16(&x.data, w);
-        for (o, a) in out.data.iter_mut().zip(add.iter()) { *o += *a; }
-        return;
-    }
-    let w_f32 = w.to_f32_weight();
-    gemm_row_major(&mut out.data, &x.data, &w_f32, m, 1.0);
 }
 
 // y[i, j] = sum_k x[i, k] * W[j, k] + beta * y[i, j].  Row-major throughout.
@@ -224,6 +273,113 @@ fn linear_gemv_f16(x: &[f32], w: &CpuWeightF16) -> Vec<f32> {
         }
     });
     out
+}
+
+// ─── INT8-weight GEMV (weight-only quant; activation stays f32, quantised per call) ──
+
+/// Single-scale symmetric activation quantisation: `xs = max|x|/127`, `xq ∈ [-127,127]`.
+/// Pads to `kpad` (a multiple of 32) to match the weight's padded cols.  Done once per
+/// GEMV call — m=1 reuses the same x across all output rows, so the O(k) cost amortises
+/// over O(rows·k) to ≤0.1%.
+fn quantize_activation(x: &[f32], kpad: usize) -> (Vec<i8>, f32) {
+    debug_assert!(x.len() <= kpad);
+    let k = x.len();
+    let mut xq = vec![0i8; kpad];
+    let mut amax = 0.0f32;
+    for &v in x { let a = v.abs(); if a > amax { amax = a; } }
+    let s = amax / 127.0;
+    let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
+    for j in 0..k {
+        xq[j] = (x[j] * inv).round().clamp(-127.0, 127.0) as i8;
+    }
+    (xq, s)
+}
+
+/// m=1 GEMV over an INT8 weight — scalar fallback, mirrors `linear_gemv_f16`'s rayon
+/// structure.  `out[i] = scale[i] * xs * Σ_j (xq[j] * wq[i,j])`.  The +0 padding tail
+/// contributes nothing.  Correctness reference for the AVX2 kernel (M2).
+fn linear_gemv_i8_scalar(x: &[f32], w: &CpuWeightI8) -> Vec<f32> {
+    let n = w.rows;
+    let kpad = w.cols;
+    debug_assert!(x.len() <= kpad);
+    let (xq, xs) = quantize_activation(x, kpad);
+    let mut out = vec![0.0f32; n];
+    let chunk = (n / (rayon::current_num_threads() * 4)).max(64).min(2048);
+    out.par_chunks_mut(chunk).enumerate().for_each(|(ci, slab)| {
+        let row0 = ci * chunk;
+        for (offset, o) in slab.iter_mut().enumerate() {
+            let row = row0 + offset;
+            let wq = &w.data[row * kpad..(row + 1) * kpad];
+            let ws = w.scale[row];
+            let mut acc = 0.0f32;
+            for j in 0..kpad {
+                acc += xq[j] as f32 * wq[j] as f32;
+            }
+            *o = acc * ws * xs;
+        }
+    });
+    out
+}
+
+/// AVX2 INT8 m=1 GEMV.  Per 32-element block: load 32 i8 (weight) × 32 i8 (activation),
+/// widen each half to i16, then `_mm256_madd_epi16` does the signed i16×i16→i32 pairwise
+/// product-sum directly (one instruction — products ≤16129, pair sums ≤32258, no saturation).
+/// Eight i32 lanes accumulate across blocks, reduced once per row.  `quantize_activation`
+/// runs once per call (m=1 shares x across all rows).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn linear_gemv_i8_avx2(x: &[f32], w: &CpuWeightI8) -> Vec<f32> {
+    use core::arch::x86_64::*;
+    let n = w.rows;
+    let kpad = w.cols;
+    debug_assert!(x.len() <= kpad && kpad % 32 == 0);
+    let nblocks = kpad / 32;
+    let (xq, xs) = quantize_activation(x, kpad);
+    let mut out = vec![0.0f32; n];
+    let chunk = (n / (rayon::current_num_threads() * 4)).max(64).min(2048);
+    out.par_chunks_mut(chunk).enumerate().for_each(|(ci, slab)| {
+        let row0 = ci * chunk;
+        // Raw pointers are derived inside the closure (not captured) so it stays `Send`.
+        unsafe {
+            let xq_ptr = xq.as_ptr();
+            let wdata = w.data.as_ptr();
+            for (offset, o) in slab.iter_mut().enumerate() {
+                let row = row0 + offset;
+                let wq_ptr = wdata.add(row * kpad);
+                let ws = w.scale[row];
+                let mut acc = _mm256_setzero_si256();
+                for b in 0..nblocks {
+                    let va = _mm256_loadu_si256(xq_ptr.add(b * 32) as *const __m256i);
+                    let vb = _mm256_loadu_si256(wq_ptr.add(b * 32) as *const __m256i);
+                    // Widen the two 128-bit halves of each vector i8×16 → i16×16.
+                    let va_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(va));
+                    let va_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(va));
+                    let vb_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vb));
+                    let vb_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(vb));
+                    // i16×i16 → pairwise i32 sum (8 i32 per half). No saturation in range.
+                    let lo = _mm256_madd_epi16(va_lo, vb_lo);
+                    let hi = _mm256_madd_epi16(va_hi, vb_hi);
+                    acc = _mm256_add_epi32(acc, _mm256_add_epi32(lo, hi));
+                }
+                let mut lanes = [0i32; 8];
+                _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, acc);
+                let total: i32 = lanes.iter().sum();
+                *o = total as f32 * ws * xs;
+            }
+        }
+    });
+    out
+}
+
+/// INT8 m=1 GEMV dispatcher.  AVX2 when the CPU supports it, else the scalar kernel.
+/// `is_x86_feature_detected!` is mandatory — calling the AVX2 kernel on a non-AVX2 CPU
+/// would be an illegal instruction (candle #2140).
+fn linear_gemv_i8(x: &[f32], w: &CpuWeightI8) -> Vec<f32> {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        return unsafe { linear_gemv_i8_avx2(x, w) };
+    }
+    linear_gemv_i8_scalar(x, w)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -475,10 +631,10 @@ pub(crate) struct CpuDecoderLayer {
     pub pln_w: Vec<f32>,
     pub qn_w: Vec<f32>,
     pub kn_w: Vec<f32>,
-    pub qkv_w: CpuWeightF16,
-    pub o_w: CpuWeightF16,
-    pub gu_w: CpuWeightF16,   // [2*inter, hidden]
-    pub dp_w: CpuWeightF16,   // [hidden, inter]
+    pub qkv_w: CpuWeightI8,
+    pub o_w: CpuWeightI8,
+    pub gu_w: CpuWeightI8,   // [2*inter, hidden]
+    pub dp_w: CpuWeightI8,   // [hidden, inter]
     pub nqh: usize, pub nkvh: usize, pub hd: usize, pub eps: f32,
 }
 
@@ -488,15 +644,21 @@ impl CpuDecoderLayer {
         prefix: &str,
         cfg: &TextDecoderConfig,
     ) -> Result<Self> {
+        // The four decoder-body linears are permanently INT8 (per-channel symmetric quantisation,
+        // AVX2 GEMV at decode time). Loaded as f16 from safetensors, then quantised once here.
+        // Validated vs the f16 path on all 7 fixtures: normalised CER ~1%, RTFx 1.2-1.6×.
+        let q = |w: Result<CpuWeightF16>| -> Result<CpuWeightI8> {
+            Ok(CpuWeightI8::from_f16(&w?))
+        };
         Ok(Self {
             iln_w: load_vec_f32(weights, &format!("{}.input_layernorm.weight", prefix))?,
             pln_w: load_vec_f32(weights, &format!("{}.post_attention_layernorm.weight", prefix))?,
             qn_w: load_vec_f32(weights, &format!("{}.self_attn.q_norm.weight", prefix))?,
             kn_w: load_vec_f32(weights, &format!("{}.self_attn.k_norm.weight", prefix))?,
-            qkv_w: load_fused_qkv_f16(weights, &format!("{}.self_attn", prefix))?,
-            o_w: load_weight_f16(weights, &format!("{}.self_attn.o_proj.weight", prefix))?,
-            gu_w: load_fused_gate_up_f16(weights, &format!("{}.mlp", prefix))?,
-            dp_w: load_weight_f16(weights, &format!("{}.mlp.down_proj.weight", prefix))?,
+            qkv_w: q(load_fused_qkv_f16(weights, &format!("{}.self_attn", prefix)))?,
+            o_w: q(load_weight_f16(weights, &format!("{}.self_attn.o_proj.weight", prefix)))?,
+            gu_w: q(load_fused_gate_up_f16(weights, &format!("{}.mlp", prefix)))?,
+            dp_w: q(load_weight_f16(weights, &format!("{}.mlp.down_proj.weight", prefix)))?,
             nqh: cfg.num_attention_heads,
             nkvh: cfg.num_key_value_heads,
             hd: cfg.head_dim,
@@ -518,7 +680,7 @@ impl CpuDecoderLayer {
         let normed = rms_norm(&x, &self.iln_w, self.eps);
 
         // 2. Fused QKV linear
-        let qkv = linear_f16(&normed, &self.qkv_w);
+        let qkv = linear_i8(&normed, &self.qkv_w);
         drop(normed);
         let q_dim = self.nqh * self.hd;
         let kv_dim = self.nkvh * self.hd;
@@ -549,20 +711,20 @@ impl CpuDecoderLayer {
         //    produced it, so we can reshape directly to [b, s, nqh*hd] — no swap needed.
         let attn_flat = attn_out.reshape(vec![b, s, self.nqh * self.hd]);
         let mut h = x;
-        linear_accum_f16(&mut h, &attn_flat, &self.o_w);
+        linear_accum_i8(&mut h, &attn_flat, &self.o_w);
         drop(attn_flat);
 
         // 6. Post-attn RMSNorm
         let normed2 = rms_norm(&h, &self.pln_w, self.eps);
 
         // 7. Gate-up linear → SiLU·up
-        let gu = linear_f16(&normed2, &self.gu_w);
+        let gu = linear_i8(&normed2, &self.gu_w);
         drop(normed2);
         let activated = silu_mul_split(&gu);
         drop(gu);
 
         // 8. Down projection with residual add
-        linear_accum_f16(&mut h, &activated, &self.dp_w);
+        linear_accum_i8(&mut h, &activated, &self.dp_w);
         h
     }
 }
@@ -821,4 +983,108 @@ fn load_fused_gate_up_f16(weights: &HashMap<String, RawTensor>, prefix: &str) ->
     fused.extend_from_slice(&gw);
     fused.extend_from_slice(&uw);
     Ok(CpuWeightF16 { data: fused, rows: 2 * inter, cols: hidden })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn f16w(rows: usize, cols: usize, vals: &[f32]) -> CpuWeightF16 {
+        assert_eq!(vals.len(), rows * cols);
+        CpuWeightF16 {
+            data: vals.iter().map(|&v| half::f16::from_f32(v)).collect(),
+            rows,
+            cols,
+        }
+    }
+
+    /// INT8 scalar GEMV must stay close to the f16 GEMV reference (per-channel weight quant
+    /// + single-scale activation quant).  This is the M1 correctness gate; the AVX2 kernel
+    /// (M2) is checked against this scalar kernel separately.
+    #[test]
+    fn int8_scalar_gemv_matches_f16() {
+        // 4×8 weight (cols zero-padded to 32 inside `from_f16`).
+        let w = f16w(4, 8, &[
+            0.5, -0.25, 0.125, 0.9, -0.6, 0.3, -0.1, 0.45,
+            -0.8, 0.2, 0.33, -0.5, 0.7, -0.15, 0.6, -0.4,
+            0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1,
+            -0.95, 0.55, -0.35, 0.75, -0.65, 0.85, -0.45, 0.25,
+        ]);
+        let x: Vec<f32> = vec![0.7, -0.4, 0.2, 0.9, -0.3, 0.6, -0.8, 0.15];
+        assert_eq!(x.len(), w.cols);
+
+        let wi = CpuWeightI8::from_f16(&w);
+        assert_eq!(wi.cols, 32, "cols must be padded to a multiple of 32");
+        assert_eq!(wi.rows, 4);
+
+        let ref_out = linear_gemv_f16(&x, &w);
+        let i8_out = linear_gemv_i8_scalar(&x, &wi);
+
+        assert_eq!(ref_out.len(), i8_out.len());
+        for (r, i) in ref_out.iter().zip(i8_out.iter()) {
+            let tol = 0.05 * r.abs() + 0.1;
+            assert!((r - i).abs() < tol, "int8 vs f16: ref={} got={} diff={}", r, i, r - i);
+        }
+    }
+
+    /// A zero activation must yield (exactly) zero output — exercises the `amax == 0` guard.
+    #[test]
+    fn int8_zero_activation() {
+        let w = f16w(2, 8, &[0.5; 16]);
+        let wi = CpuWeightI8::from_f16(&w);
+        let x = vec![0.0f32; 8];
+        let out = linear_gemv_i8_scalar(&x, &wi);
+        for v in &out {
+            assert!(v.abs() < 1e-5, "zero activation should give ~0, got {}", v);
+        }
+    }
+
+    /// `dequant_to_f32` (prefill path) must approximate the original f16 weight per row.
+    #[test]
+    fn int8_dequant_approximates_f16() {
+        let w = f16w(3, 8, &[
+            0.5, -0.25, 0.125, 0.9, -0.6, 0.3, -0.1, 0.45,
+            -0.8, 0.2, 0.33, -0.5, 0.7, -0.15, 0.6, -0.4,
+            0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1,
+        ]);
+        let wi = CpuWeightI8::from_f16(&w);
+        let dq = wi.dequant_to_f32(w.cols); // real k = 8
+        assert_eq!((dq.rows, dq.cols), (3, 8));
+        for i in 0..w.rows {
+            for j in 0..w.cols {
+                let orig = w.data[i * w.cols + j].to_f32();
+                let tol = 0.06 * orig.abs() + wi.scale[i];
+                assert!((dq.data[i * w.cols + j] - orig).abs() < tol,
+                        "dequant row {} col {}: orig={} got={}", i, j, orig, dq.data[i * w.cols + j]);
+            }
+        }
+    }
+
+    /// AVX2 kernel must match the scalar kernel element-wise — the M2 SIMD correctness gate.
+    /// They should agree near-bit-exactly: both accumulate exact integer products (i8×i8 fits
+    /// i32; 32 terms ≤ ~516k stay exact in both i32 and f32) before the single `* ws * xs`.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn int8_avx2_matches_scalar() {
+        if !is_x86_feature_detected!("avx2") {
+            eprintln!("skipping: host has no AVX2");
+            return;
+        }
+        // 8×32 weight, diverse values in [-0.9, 0.9] (a sin pattern exercises mixed signs
+        // and varied per-row magnitudes → varied per-channel scales).
+        let vals: Vec<f32> = (0..(8 * 32)).map(|k| ((k as f32) * 0.037).sin() * 0.9).collect();
+        let w = f16w(8, 32, &vals);
+        let x: Vec<f32> = (0..32).map(|i| (i as f32) * 0.07 - 1.1).collect();
+        assert_eq!(x.len(), w.cols);
+
+        let wi = CpuWeightI8::from_f16(&w);
+        let scalar = linear_gemv_i8_scalar(&x, &wi);
+        let avx2 = unsafe { linear_gemv_i8_avx2(&x, &wi) };
+
+        assert_eq!(scalar.len(), avx2.len());
+        for (s, a) in scalar.iter().zip(avx2.iter()) {
+            assert!((s - a).abs() < 1e-3 * s.abs() + 1e-4,
+                    "avx2 vs scalar: scalar={} avx2={}", s, a);
+        }
+    }
 }

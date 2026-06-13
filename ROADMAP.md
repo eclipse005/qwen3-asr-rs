@@ -4,7 +4,7 @@
 
 ## 0. 项目是什么
 
-Qwen3-ASR（0.6B / 1.7B）的 Rust 推理库。**双后端**：CUDA（cuBLAS + NVRTC 手写 kernel）和 CPU（gemm + rayon），均端到端可用。权重 f16 存储 + f32 计算，兼顾内存和精度。
+Qwen3-ASR（0.6B / 1.7B）的 Rust 推理库。**双后端**：CUDA（cuBLAS + NVRTC 手写 kernel）和 CPU（gemm + rayon），均端到端可用。CPU 解码器 body 走 INT8 weight-only 量化（per-channel + AVX2 GEMV）；其余权重 f16 存储 + f32 计算。
 
 ## 1. 当前在哪
 
@@ -20,7 +20,7 @@ src/
 ├── inference.rs          # AsrInference 装配 + mel→embed→generate 主循环
 ├── raw_tensor.rs         # safetensors 原始字节 view（weight loading 用）
 ├── cpu_audio_encoder.rs  # ★ 手写 CPU 音频编码器（im2col + gemm + rayon + f16 权重）
-├── cpu_engine.rs         # ★ 手写 CPU 文本解码器（gemm + rayon + f16 权重）
+├── cpu_engine.rs         # ★ 手写 CPU 文本解码器（gemm + rayon + INT8 权重，AVX2 GEMV）
 ├── cudarc_engine.rs      # ★ 手写 GPU 文本解码器（cuBLAS + NVRTC kernel）+ DecodeScratch 复用
 ├── gpu_audio_encoder.rs  # ★ 手写 GPU 音频编码器（cuBLAS + 自定义 conv2d/im2col）
 └── kernels/kernels.cu    # 所有 CUDA kernel（运行时 NVRTC 编译）
@@ -40,22 +40,26 @@ tests/
 ```toml
 default = ["cuda"]      # 端到端可用
 cuda = ["dep:cudarc"]
-cpu  = ["dep:gemm", "dep:rayon"]  # 端到端可用（f16 权重 + f32 计算）
+cpu  = ["dep:gemm", "dep:rayon"]  # 端到端可用（解码器 body INT8 + 其余 f16，f32 计算）
 hub  = ["dep:reqwest"]
 ```
 
 ### 1.4 性能（基准线，P104-100）
 
-#### CPU 0.6B（Ryzen/Intel，f16 权重存储）
+#### CPU 0.6B（Ryzen/Intel，INT8 weight-only 量化，默认）
 
-| 音频 | RTFx | 耗时 |
-|---|---|---|
-| 15s 英文 | 4.16× | 3.6s |
-| 30s 中文 | 3.72× | 8.1s |
-| 90s 英文 | 3.87× | 23.2s |
-| 89s 日文 | 4.22× | 21.1s |
-| 180s 中文 | 4.18× | 43.0s |
-| 180s 英文 | 4.15× | 43.3s |
+解码器 4 个 linear（qkv/o/gate_up/down）走 INT8（per-channel 对称量化 + AVX2 GEMV，运行时 `is_x86_feature_detected!` 分发 + 标量 fallback）；lm_head/embed_table/音频编码器仍 f16。解码器 body 永久 INT8，无开关、无 f16 回退分支。
+
+| 音频 | RTFx (INT8) | 耗时 | vs f16 提速 |
+|---|---|---|---|
+| 15s 英文 | 4.94× | 3.0s | 1.23× |
+| 30s 中文 | 5.48× | 5.5s | 1.57× |
+| 90s 英文 | 5.82× | 15.5s | 1.52× |
+| 89s 日文 | 6.10× | 14.6s | 1.57× |
+| 180s 中文 | 5.35× | 33.6s | 1.40× |
+| 180s 英文 | 5.47× | 32.9s | 1.38× |
+
+精度：全 7 fixture 归一化 CER ~1%（英文/中文短音频全过；180s 中文 ~3.6%、89s 日文 ~1.9% raw，但绝大多数是标点/合法改写，真实存疑字 <1%，集中在同音决策边界）。
 
 #### CUDA 0.6B（P104-100，Pascal sm_61）
 
@@ -85,16 +89,16 @@ hub  = ["dep:reqwest"]
 
 ### 1.5 内存
 
-90s 音频 0.6B CPU 峰值工作集约 **3,482 MB**（f16 权重），比纯 f32 的 4,657 MB 节省 ~25%。
+90s 音频 0.6B CPU 峰值工作集约 **3,520 MB**（INT8 默认，与 f16 持平 ~3,522 MB）。INT8 只减解码器 body 权重存储（f16→i8，~205MB），但 prefill 仍把权重反量化成 f32 跑 gemm，峰值由 prefill 激活主导，故 RSS 不降。f16 权重相对纯 f32 仍省 ~25%（3.5GB vs 4.66GB）。
 
 ## 2. 关键架构事实
 
 ### 2.1 权重存储：f16 + f32 计算
 
-两个后端统一模式：
-- **存储**：`CpuWeightF16 { data: Vec<half::f16>, rows, cols }`（音频编码器 + 文本解码器共用类型名，分别定义在各自的文件里）
-- **CPU 解码** (m=1)：`linear_gemv_f16` 直接读 f16 权重，寄存器内转 f32 累加 → 省一半内存带宽，比 f32 GEMV 快 5-9%
-- **CPU prefill** (m>1)：rayon `par_iter` 批量 f16→f32 转换后走 gemm crate 的 f32 GEMM
+两个后端统一模式（CPU 解码器 body 例外，已 INT8 量化）：
+- **存储**：音频编码器 / lm_head / embed_table 用 `CpuWeightF16 { data: Vec<half::f16>, rows, cols }`；解码器 body 4 个 linear 用 `CpuWeightI8 { data: Vec<i8>, scale: Vec<f32>, rows, cols }`（load 时从 f16 量化，cols 补齐到 32 倍数）
+- **CPU 解码** (m=1)：`linear_gemv_i8` 走 AVX2 INT8 GEMV（per-channel 权重 scale + 单尺度激活 scale，widen→madd），比 f16 GEMV 快 1.2-1.6×（标量 fallback 在无 AVX2 时）
+- **CPU prefill** (m>1)：`dequant_to_f32` 把 INT8 权重反量化成 f32，走 gemm crate 的 f32 GEMM（prefill 不量化激活）
 - **CPU 音频编码器**：顺序 f16→f32 转换（权重小，~100 次/forward，rayon 反而慢）
 - **GPU**：cuBLAS f16 GEMM 直接消费 f16 权重
 
@@ -120,9 +124,9 @@ ConvStem: 3× conv2d (im2col + gemm) + GELU + permute + positional encoding
 + final RMSNorm → embed_table linear → argmax
 ```
 
-- decode (m=1): `linear_gemv_f16` 直接读 f16，寄存器内转 f32
-- prefill (m>1): rayon 批量 f16→f32，然后 gemm crate f32 GEMM
-- `linear_accum_f16`: 带 residual 累加的线性层（cuBLAS beta=1 思路的 CPU 版）
+- decode (m=1): `linear_gemv_i8` AVX2 INT8 GEMV（per-channel 权重 scale + 单尺度激活 scale，无 AVX2 走标量 fallback）
+- prefill (m>1): `dequant_to_f32` 反量化 INT8→f32，然后 gemm crate f32 GEMM
+- `linear_accum_i8`: 带 residual 累加的 INT8 线性层（cuBLAS beta=1 思路的 CPU 版）
 
 ### 2.4 GPU 解码器主路径（`inference.rs::generate_cuda`）
 
@@ -198,6 +202,7 @@ kernel 存在（`lm_head_gemv_argmax_f16`）但注释说"目前输给 cuBLAS"，
 - [x] CPU 文本解码器：28 层 decoder（gemm + rayon）
 - [x] CPU 端到端 transcribe 全部 fixture 通过
 - [x] f16 权重存储（音频编码器 + 文本解码器），内存节省 ~25%
+- [x] CPU 文本解码器 INT8 weight-only 量化（per-channel 对称 + AVX2 GEMV，默认开启；RTFx 1.2-1.6×，归一化 CER ~1%；内存持平）
 - [x] GPU 全部 13 个集成测试通过
 - [x] CUDA Graph 死代码清理
 - [x] 脱离 burn 框架
@@ -212,7 +217,8 @@ kernel 存在（`lm_head_gemv_argmax_f16`）但注释说"目前输给 cuBLAS"，
 
 ### 5.2 P2：CPU 优化
 
-- [ ] **AVX2 手写 GEMV** — 当前 decode 用标量循环读 f16→f32 累加，SIMD 可加速 2-4×
+- [x] **INT8 weight-only 量化 + AVX2 GEMV** — 已完成并收口（解码器 body 永久 INT8，无 f16 回退分支）。decode 路径 RTFx 1.2-1.6×（见 §1.4）。
+- [ ] **prefill 也走 INT8 GEMM**（当前 prefill 反量化到 f32，是峰值 RSS 不降的原因，也是 prefill 耗时大头）
 - [ ] **im2col SIMD** — 卷积 im2col 生成目前是标量赋值
 - [ ] **注意力微优化** — 目前标量 + rayon 跨 head，可尝试分块矩阵乘
 - [ ] 更激进的 rayon 策略（跨层并行？prefill 阶段流水线？）
@@ -239,13 +245,15 @@ kernel 存在（`lm_head_gemv_argmax_f16`）但注释说"目前输给 cuBLAS"，
 - **NVRTC 编译需要 CUDA_PATH**（Windows: `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.x`）
 - **cudarc 0.19**（`cuda-12080` feature）
 - **`__launch_bounds__` 在所有 kernel 上**（Pascal sm_61 register pressure 优化）
-- **f16 + f32 累加**是统一模式，不要降级
+- **f16 + f32 累加**是音频编码器 / lm_head / embed_table 的统一模式，不要降级；解码器 body 已是 INT8（AVX2 GEMV），见 §2.1 / §2.3
 - **Pascal driver 有 enqueue 限速**（alloc_zeros → memset 触发），alloc_uninit 收益巨大
 - **测试多线程跑会抢 GPU** — 必须 `--test-threads=1`
 - **`h_buf` 跨步复用**：decode 步 28 层改 `h` in-place，final_norm 写到 `scratch.final_norm`，不修改 `h`
 - **CPU 音频编码器**：attention 用标量循环 + rayon 跨 head 并行，不要换 GEMM per-head（小窗口 overhead 更大）
 - **CPU f16→f32 转换**：音频编码器顺序转（100+ 次小权重，rayon 开销大于收益）；文本解码器 prefill 用 rayon 转（大权重 ~1.2GB，rayon 明显更快）
 - **`half` crate v2** 是无条件依赖（不是 optional），GPU 和 CPU 路径都用
+- **CPU 解码器 body 永久 INT8**（per-channel 对称 + AVX2 GEMV，`is_x86_feature_detected!` 分发）。4 个 decoder linear 在 `CpuDecoderLayer::load` 时从 f16 量化成 `CpuWeightI8`；lm_head/embed_table/音频编码器仍 f16（`linear_gemv_f16`）。无开关、无 f16 回退分支。INT8 是**提速**优化，**不减峰值内存**（prefill 仍反量化 f32）。
+- **CER 对照工具**：`examples/cer_compare.rs`（解析两次 transcribe stdout 算 raw + 归一化 CER）；`examples/mem_probe.ps1`（轮询测试进程峰值 RSS）。
 
 ## 7. 给接手 AI 的具体操作
 
