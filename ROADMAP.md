@@ -103,6 +103,10 @@ hub  = ["dep:reqwest"]
 - CUDA: `cargo test --release --test transcribe -- --ignored --nocapture --test-threads=1`
 - CPU: `cargo test --release --no-default-features --features cpu --test cpu_transcribe -- --nocapture --test-threads=1`
 
+**2026-06-13 CUDA 阶段分解（0.6B，进程内 info! 计时，D2H 自动 sync）**：decode 占 75-80%（8.78ms/tok@15s → 11.70ms/tok@90s），prefill 10-11%，audio_enc 7-10%，mel+setup ~4%。decode vs 带宽下限（decoder+lm_head ~750MB f16 / P104 ~200GB/s ≈ 3.75ms/tok）有 ~2× 余量，疑为 launch 开销（§2.5 #9 Pascal enqueue 限速）+ 非-TC kernel。
+
+**跨架构可移植（强卡更强，已具备）**：① cuBLAS GEMM 设了 `CUBLAS_TENSOR_OP_MATH`（cudarc_engine.rs:133）→ 在 tensor-core 卡（Volta+，如 RTX 3080 sm_86）自动用 TC，Pascal 走非-TC。② NVRTC kernel 运行时按当前卡 `sm_{major}{minor}` 编译（cudarc_engine.rs:141）→ 不写死 sm_61。所以**无需为 3080 改代码**，直接打包即可，RTFx 会显著高于 P104。唯一 P104 经验旋钮：attention chunk 256/512（cudarc_engine.rs:1381），3080 上 SM 更多可能要重调。
+
 ### 1.5 内存
 
 CPU 峰值 RSS 随音频长度分两段（INT8 默认；每 fixture 独立进程实测，Win32 PeakWorkingSet）：
@@ -193,9 +197,9 @@ decode loop（每步）：
 
 ### 3.1 [已删] CUDA Graph — 硬件不支持（sm_61），代码已清理
 
-### 3.2 Conv stem 走 CPU detour
+### 3.2 [已修] Conv stem permute — 已是 GPU kernel
 
-`gpu_audio_encoder.rs::GpuConvStem::forward` 末尾：GPU→CPU download→permute `[b,c,f,t]→[b,t,c,f]`→重新 upload。**单次推理 ~5-10ms**。修法：写一个 4D permute kernel 替换。
+`gpu_audio_encoder.rs::GpuConvStem::forward` 的 `[b,c,f,t]→[b,t,c,f]` permute 现在走 GPU kernel `permute_bcft_to_btcf_f16`（kernels.cu:1275），无 CPU 绕路。曾是 CPU detour（~5-10ms），已消除。
 
 ### 3.3 已知 dead code（rustc 警告）
 
@@ -224,6 +228,7 @@ kernel 存在（`lm_head_gemv_argmax_f16`）但注释说"目前输给 cuBLAS"，
 - [x] f16 权重存储（音频编码器 + 文本解码器），内存节省 ~25%
 - [x] CPU 文本解码器 INT8 weight-only 量化（per-channel 对称 + AVX2 GEMV，默认开启；RTFx 1.2-1.6×，归一化 CER ~1%；内存持平）
 - [x] CPU prefill attention：手写 SSE2-标量 → gemm crate（AVX2-FMA）。attn 182→91ms/层（2×），prefill −34% @180s，180s RTFx +8%。零精度风险。单测 `prefill_attention_matches_reference`（见 §1.4）
+- [x] GPU conv stem permute：已是 GPU kernel `permute_bcft_to_btcf_f16`（kernels.cu，无 CPU detour）。此前文件头/ROADMAP 注释过时，已更正（§3.2）。
 - [x] GPU 全部 13 个集成测试通过
 - [x] CUDA Graph 死代码清理
 - [x] 脱离 burn 框架
@@ -232,8 +237,8 @@ kernel 存在（`lm_head_gemv_argmax_f16`）但注释说"目前输给 cuBLAS"，
 
 ### 5.1 P1：CUDA 小优化（明确收益）
 
-- [ ] **Conv stem GPU permute kernel**（§3.2）— 消除 CPU detour ~5-10ms
-- [ ] **lm_head 融合重测**（§3.6）— 可能已比纯 cuBLAS 快
+- [x] **Conv stem GPU permute kernel**（§3.2）— 已是 GPU kernel `permute_bcft_to_btcf_f16`，CPU detour 已消除
+- [ ] **lm_head 融合重测**（§3.6）— **2026-06-13 分析后判定不值得**：现有融合 kernel 是单 block（grid=1，只用 1 SM，这才是"输给 cuBLAS"的真因）；且 lm_head GEMV 读 311MB/token 是带宽受限，多 block 融合顶多追平 cuBLAS + 省个 argmax pass（~10µs/token ≈ 0.1%）。cuBLAS f16 GEMV 已在带宽下限。**结论：~0.1%，跳过。**
 - [ ] dead code warning 清理（`#[allow(dead_code)]` 或删）
 
 ### 5.2 P2：CPU 优化
@@ -253,7 +258,7 @@ kernel 存在（`lm_head_gemv_argmax_f16`）但注释说"目前输给 cuBLAS"，
 
 - [ ] PinnedHostSlice 异步 argmax（`cudaStreamAddCallback`，省 ~50µs/step）
 - [ ] KV cache 预 fetch（prefill 后第一个 decode 步不等 cuBLAS）
-- [ ] cuBLASLt 替换（Pascal f16 GEMM ~10% 提升空间）
+- [ ] **cuBLASLt 替换** — **2026-06-13 评估后降级**：① Pascal 无 tensor core，cuBLAS 和 cuBLASLt 跑同类 f16 kernel，~10% 不保证；② cuBLAS 已设 `CUBLAS_TENSOR_OP_MATH`，在 Ampere+ 自动用 TC，**cuBLASLt 非启用 TC 的必要条件**；③ cudarc safe API 每次 matmul 重建 desc+跑 heuristic（decode 33k+ GEMM 会反超），需手写 plan 缓存（高工作量）；④ decode 疑 launch-bound（非 kernel-bound），cuBLASLt 动不到主因。**仅当上 Ampere 实测 cuBLAS 不够、且能本地验证时再考虑。**
 
 ### 5.5 不做
 

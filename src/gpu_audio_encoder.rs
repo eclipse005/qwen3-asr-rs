@@ -5,9 +5,9 @@
 //!   → 18 × { LayerNorm + Self-attention (windowed) + LayerNorm + FFN (GELU) }
 //!   → ln_post + proj1 + GELU + proj2
 //!
-//! Conv stem runs on GPU (im2col + cuBLAS GEMM + fused bias+GELU).  The
-//! `[b, c, f, t] → [b, t, c, f]` permute after the stem currently detours
-//! through CPU — see ROADMAP.md §3.3 for the planned GPU permute kernel.
+//! Conv stem runs fully on GPU: im2col + cuBLAS GEMM + fused bias+GELU, then a
+//! `[b, c, f, t] → [b, t, c, f]` permute via the `permute_bcft_to_btcf_f16` kernel
+//! (no CPU detour), then conv_out (Linear) + sinusoidal PE add.
 
 use anyhow::Result;
 use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};

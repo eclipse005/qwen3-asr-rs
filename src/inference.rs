@@ -268,10 +268,14 @@ impl AsrInferenceInner {
             }
             #[cfg(feature = "cuda")]
             Engine::Cuda { audio_encoder, .. } => {
+                let t_mel = std::time::Instant::now();
                 let (mel_data, n_mels, n_frames) = self.mel_extractor.extract(samples)?;
-                debug!("Mel: {}×{} frames", n_mels, n_frames);
+                let t_enc = std::time::Instant::now();
+                info!("CUDA mel: {:.2}ms ({}x{} frames)", t_mel.elapsed().as_secs_f64() * 1000.0, n_mels, n_frames);
                 let n_window = self.config.thinker_config.audio_config.n_window;
                 let out = audio_encoder.encode_from_mel(&mel_data, n_mels, n_frames, n_window)?;
+                // encode_from_mel ends with a D2H → host timing is accurate (no extra sync needed).
+                info!("CUDA audio_enc: {:.2}ms", t_enc.elapsed().as_secs_f64() * 1000.0);
                 let output_dim = self.config.thinker_config.audio_config.output_dim;
                 let n_tokens = out.len() / output_dim;
                 info!("Audio tokens: {}", n_tokens);
@@ -433,6 +437,7 @@ impl AsrInferenceInner {
             text_cfg.num_key_value_heads, total_positions, text_cfg.head_dim,
         )?;
 
+        let t_prefill = std::time::Instant::now();
         let logits = decoder.forward(hidden_states, &cos_table, &sin_table, &mut kv_cache, 0, true, true)?;
         let mut current_pos = seq_len;
 
@@ -445,10 +450,11 @@ impl AsrInferenceInner {
         let mut scratch = DecodeScratch::new(cuda, total_positions, text_cfg)?;
         let mut h_buf = scratch.embed_out.clone();
 
-        // D2H of first token into pinned host memory.
+        // D2H of first token into pinned host memory — the copy syncs, so t_prefill is accurate.
         // Safety: as_ptr() calls event.synchronize() ensuring the copy completes before returning.
         cuda.download_i32_into_pinned(&token_buf, &mut scratch.pinned_token)?;
         let mut next_token = unsafe { *scratch.pinned_token.as_ptr()? } as i64;
+        info!("Prefill: {:.2}ms", t_prefill.elapsed().as_secs_f64() * 1000.0);
 
         let t_decode = std::time::Instant::now();
         loop {
