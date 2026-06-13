@@ -68,6 +68,7 @@ rms_norm_f16(
 
 // ─── Fused: residual_inplace = residual + add_in; out = rms_norm(residual_inplace, w) ──
 // Writes `residual_inplace` with the residual sum AND `out` with the normed result.
+// Uses __half2 vectorized loads for 2x memory throughput.
 // Shared mem: bs * sizeof(float).
 extern "C" __global__ void __launch_bounds__(1024, 2)
 add_residual_rms_norm_f16(
@@ -86,14 +87,21 @@ add_residual_rms_norm_f16(
 
     extern __shared__ float sdata[];
 
-    // Pass 1: residual sum + sum of squares
+    int last2 = last / 2;
+    const __half2* ri2 = (const __half2*)(residual_inplace + row * last);
+    const __half2* ai2 = (const __half2*)(add_in + row * last);
+    __half2* o2 = (__half2*)(residual_inplace + row * last);
+
+    // Pass 1: residual sum + sum of squares (vectorized)
     float local = 0.0f;
-    for (int j = tid; j < last; j += bs) {
-        float r = __half2float(residual_inplace[row * last + j]);
-        float a = __half2float(add_in[row * last + j]);
-        float v = r + a;
-        residual_inplace[row * last + j] = __float2half(v);
-        local += v * v;
+    for (int j = tid; j < last2; j += bs) {
+        __half2 rv = ri2[j];
+        __half2 av = ai2[j];
+        float rx = __half2float(rv.x), ry = __half2float(rv.y);
+        float ax = __half2float(av.x), ay = __half2float(av.y);
+        float vx = rx + ax, vy = ry + ay;
+        o2[j] = __halves2half2(__float2half(vx), __float2half(vy));
+        local += vx * vx + vy * vy;
     }
     sdata[tid] = local;
     __syncthreads();
@@ -103,10 +111,17 @@ add_residual_rms_norm_f16(
     }
     float inv_rms = rsqrtf(sdata[0] / (float)last + eps);
 
-    // Pass 2: normalize
-    for (int j = tid; j < last; j += bs) {
-        float v = __half2float(residual_inplace[row * last + j]) * inv_rms * __half2float(w[j]);
-        out[row * last + j] = __float2half(v);
+    // Pass 2: normalize (vectorized)
+    const __half2* norm2 = (const __half2*)(residual_inplace + row * last);
+    const __half2* w2 = (const __half2*)w;
+    __half2* out2 = (__half2*)(out + row * last);
+    for (int j = tid; j < last2; j += bs) {
+        __half2 nv = norm2[j];
+        __half2 wv = w2[j];
+        out2[j] = __halves2half2(
+            __float2half(__half2float(nv.x) * inv_rms * __half2float(wv.x)),
+            __float2half(__half2float(nv.y) * inv_rms * __half2float(wv.y))
+        );
     }
 }
 
@@ -1058,7 +1073,7 @@ fused_gqa_decode_split_p1_f16(
     for (int t = tid; t < chunk_len; t += bs) {
         if (smem[t] > local_max) local_max = smem[t];
     }
-    __shared__ float reduce_buf[1024];
+    __shared__ float reduce_buf[256];
     reduce_buf[tid] = local_max;
     __syncthreads();
     for (int s = bs >> 1; s > 0; s >>= 1) {

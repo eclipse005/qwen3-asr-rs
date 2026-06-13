@@ -11,7 +11,7 @@ use anyhow::Result;
 use cudarc::cublas::safe::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
 use cudarc::cublas::sys;
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PinnedHostSlice, PushKernelArg,
 };
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use half::f16;
@@ -109,6 +109,7 @@ pub(crate) struct CudaKernels {
 }
 
 pub(crate) struct CudaState {
+    pub ctx: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
     pub blas: CudaBlas,
     pub k: CudaKernels,
@@ -187,7 +188,7 @@ impl CudaState {
             add_pe: module.load_function("add_pe_f16")?,
         };
 
-        Ok(Self { stream, blas, k })
+        Ok(Self { ctx: ctx.clone(), stream, blas, k })
     }
 
     pub fn upload_f16(&self, data: &[f16]) -> Result<CudaSlice<f16>> {
@@ -214,6 +215,10 @@ impl CudaState {
     }
     pub fn download_i32(&self, slice: &CudaSlice<i32>) -> Result<Vec<i32>> {
         Ok(self.stream.clone_dtoh(slice)?)
+    }
+    /// D2H into pinned host memory. `dst.as_ptr()` synchronizes then returns the value.
+    pub fn download_i32_into_pinned(&self, src: &CudaSlice<i32>, dst: &mut PinnedHostSlice<i32>) -> Result<()> {
+        Ok(self.stream.memcpy_dtoh(src, dst)?)
     }
 
     pub fn upload_tensor(&self, t: &CpuTensor) -> Result<GpuTensor> {
@@ -1108,6 +1113,9 @@ pub(crate) struct DecodeScratch {
     pub final_norm: CudaSlice<f16>,     // [hidden_size]
     pub logits: CudaSlice<f16>,         // [vocab_size]
 
+    // Pinned host buffer for async D2H of the decoded token.
+    pub pinned_token: PinnedHostSlice<i32>,
+
     // Static dimensions (cached to avoid re-computing)
     pub hs: usize,     // hidden_size
     pub nqh: usize,    // num_attention_heads
@@ -1144,6 +1152,7 @@ impl DecodeScratch {
             embed_out: cuda.alloc_uninit_f16(hs)?,
             final_norm: cuda.alloc_uninit_f16(hs)?,
             logits: cuda.alloc_uninit_f16(vocab)?,
+            pinned_token: unsafe { cuda.ctx.alloc_pinned::<i32>(1)? },
             hs, nqh, nkvh, hd, inter, vocab,
         })
     }

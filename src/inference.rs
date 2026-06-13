@@ -441,11 +441,14 @@ impl AsrInferenceInner {
 
         let mut token_buf = cuda.alloc_uninit_i32(1)?;
         cuda.argmax_into(&logits, &mut token_buf, 0)?;
-        let dl = cuda.download_i32(&token_buf)?;
-        let mut next_token = dl[0] as i64;
 
         let mut scratch = DecodeScratch::new(cuda, total_positions, text_cfg)?;
         let mut h_buf = scratch.embed_out.clone();
+
+        // D2H of first token into pinned host memory.
+        // Safety: as_ptr() calls event.synchronize() ensuring the copy completes before returning.
+        cuda.download_i32_into_pinned(&token_buf, &mut scratch.pinned_token)?;
+        let mut next_token = unsafe { *scratch.pinned_token.as_ptr()? } as i64;
 
         let t_decode = std::time::Instant::now();
         loop {
@@ -459,8 +462,10 @@ impl AsrInferenceInner {
                 &mut h_buf, &cos_table, &sin_table, &mut kv_cache, current_pos,
                 &mut token_buf, &mut scratch,
             )?;
-            let dl = cuda.download_i32(&token_buf)?;
-            next_token = dl[0] as i64;
+            // D2H into pinned memory — avoids implicit full-stream sync of pageable D2H.
+            // Safety: as_ptr() calls event.synchronize() ensuring the copy completes before returning.
+            cuda.download_i32_into_pinned(&token_buf, &mut scratch.pinned_token)?;
+            next_token = unsafe { *scratch.pinned_token.as_ptr()? } as i64;
             current_pos += 1;
         }
         cuda.synchronize()?;
