@@ -1210,6 +1210,37 @@ impl CudaState {
         Ok(())
     }
 
+    /// fused_gqa_decode writing into a pre-allocated `out` buffer (flat, no GpuTensor).
+    /// Single-kernel path for short-to-medium context (cur_len ≤ ~1024). Saves 1 launch
+    /// vs the split path (p1+p2). Used by decode when cur_len is below the split threshold.
+    pub fn fused_gqa_decode_into(&self, q: &CudaSlice<f16>,
+        k_cache: &CudaSlice<f16>, v_cache: &CudaSlice<f16>,
+        nqh: usize, nkvh: usize, max_seq: usize, cur_len: usize, scale: f32,
+        out: &mut CudaSlice<f16>,
+    ) -> Result<()> {
+        let b: usize = 1;
+        let d: usize = out.len() / nqh;  // nqh * d = out.len()
+        // Adaptive block size: scale with cur_len. bs must be multiple of d, power of 2.
+        let bs: u32 = if cur_len > 1024 { 1024 }
+                      else if cur_len > 512 { 512 }
+                      else { 256 };
+        let t_chunks = (bs as usize / d).max(1);
+        let smem_bytes = (cur_len + d * t_chunks) * 4;
+        let cfg = LaunchConfig {
+            grid_dim: ((b * nqh) as u32, 1, 1),
+            block_dim: (bs, 1, 1),
+            shared_mem_bytes: smem_bytes as u32,
+        };
+        let b_i = b as i32; let nqh_i = nqh as i32; let nkvh_i = nkvh as i32;
+        let max_i = max_seq as i32; let d_i = d as i32; let cur_i = cur_len as i32;
+        let mut bb = self.stream.launch_builder(&self.k.fused_gqa_decode);
+        bb.arg(out); bb.arg(q); bb.arg(k_cache); bb.arg(v_cache);
+        bb.arg(&b_i); bb.arg(&nqh_i); bb.arg(&nkvh_i); bb.arg(&max_i);
+        bb.arg(&d_i); bb.arg(&cur_i); bb.arg(&scale);
+        unsafe { bb.launch(cfg) }?;
+        Ok(())
+    }
+
     /// fused_gqa_decode_split writing into pre-allocated partial + output buffers.
     /// `max_chunks` is the fixed grid y-dimension (upper bound for graph stability).
     pub fn fused_gqa_decode_split_into(&self, q: &CudaSlice<f16>,
@@ -1428,16 +1459,27 @@ impl GpuDecoderLayer {
         )?;
         let cur_len = kv_start + 1;
 
-        // 5. Attention — always use split path with fixed grid for stable graph topology
+        // 5. Attention — use single-kernel path for short context (saves 1 launch/layer
+        //    vs split p1+p2), split-K for long context (>1024 tokens). The "always split"
+        //    decision was for CUDA Graph stability, which was removed (§3.1).
         let scale = 1.0f32 / (self.hd as f32).sqrt();
-        let chunk_size: usize = if cur_len >= 2048 { 512 } else { 256 };
-        let max_chunks = (kv.max_seq + 255) / 256; // fixed upper bound for grid y-dim
-        cuda.fused_gqa_decode_split_into(
-            &scratch.q_out, &kv.k[layer_idx], &kv.v[layer_idx],
-            self.nkvh, kv.max_seq, cur_len, scale, chunk_size, max_chunks,
-            &mut scratch.split_part_out, &mut scratch.split_part_max, &mut scratch.split_part_sum,
-            &mut scratch.attn_out,
-        )?;
+        const SPLIT_THRESHOLD: usize = 1024;
+        if cur_len <= SPLIT_THRESHOLD {
+            cuda.fused_gqa_decode_into(
+                &scratch.q_out, &kv.k[layer_idx], &kv.v[layer_idx],
+                self.nqh, self.nkvh, kv.max_seq, cur_len, scale,
+                &mut scratch.attn_out,
+            )?;
+        } else {
+            let chunk_size: usize = if cur_len >= 2048 { 512 } else { 256 };
+            let max_chunks = (kv.max_seq + 255) / 256;
+            cuda.fused_gqa_decode_split_into(
+                &scratch.q_out, &kv.k[layer_idx], &kv.v[layer_idx],
+                self.nkvh, kv.max_seq, cur_len, scale, chunk_size, max_chunks,
+                &mut scratch.split_part_out, &mut scratch.split_part_max, &mut scratch.split_part_sum,
+                &mut scratch.attn_out,
+            )?;
+        }
 
         // 6. O-proj + residual: h += attn_out @ O^T  (cuBLAS beta=1)
         cuda.linear_gpu_accum_slice(h, &scratch.attn_out, &self.o_w)?;

@@ -81,23 +81,27 @@ hub  = ["dep:reqwest"]
 
 | 音频 | RTFx |
 |---|---|
-| 15s 英文 | 24.23× |
-| 30s 中文 | 16.00× |
-| 90s 英文 | 16.48× |
-| 89s 日文 | 17.51× |
-| 180s 中文 | 14.20× |
-| 180s 英文 | 15.19× |
+| 15s 英文 | 25.43× |
+| 30s 中文 | 16.60× |
+| 90s 英文 | 16.58× |
+| 89s 日文 | 21.12× |
+| 180s 中文 | 27.50× |
+| 180s 英文 | 23.37× |
+
+> 注：180s 等长音频 RTFx 跨 run 波动大（VM 热降频，§6），单次运行不可靠。15-90s 短音频数字较稳定。2026-06-14 更新：decode attention 从"总是 split（2 kernel）"改为"短 context 用单 kernel"（cur_len ≤ 1024），15s RTFx 24.23→25.43（+5%），属 launch 开销减少的真实收益。长音频数字差异以热噪声为主。
 
 #### CUDA 1.7B（P104-100）
 
 | 音频 | RTFx |
 |---|---|
-| 15s 英文 | 8.93× |
-| 30s 中文 | 7.74× |
-| 90s 英文 | 8.56× |
-| 89s 日文 | 9.74× |
-| 180s 中文 | 7.94× |
-| 180s 英文 | 8.45× |
+| 15s 英文 | 9.12× |
+| 30s 中文 | 7.96× |
+| 90s 英文 | 8.56×（旧；连续跑热噪声大）|
+| 89s 日文 | 9.76×（单独凉机跑）|
+| 180s 中文 | ~8×（噪声大，单次不可靠）|
+| 180s 英文 | ~8.5×（噪声大）|
+
+> 注：1.7B 计算量大，连续跑多 fixture 极易触发热降频（§6），cross-run RTFx 噪声远大于 0.6B。15s/30s 短音频 + 89s_ja 单独凉机跑的数字可靠。90s/180s 连续跑出的数字（如 2.98×）是热噪声假象，不代表真实性能。
 
 数字来源：
 - CUDA: `cargo test --release --test transcribe -- --ignored --nocapture --test-threads=1`
@@ -192,6 +196,7 @@ decode loop（每步）：
 10. skip clone_tensor at O-proj：23.5× ← `50d2524`
 11. GPU-resident next-token：23.7× ← `4675c74`
 12. fused QKV extract kernel：24× ← `f1df993`
+13. **decode attention 短 context 用单 kernel（cur_len ≤ 1024 不 split）**：25.4× ← 2026-06-14。原"总是 split"是为已删的 CUDA Graph 稳定性（§3.1），改回条件分支后省 28 launches/step，15s RTFx +5%。"短用单 / 长用 split"和 prefill 路径（§2.4 forward）逻辑一致。
 
 ## 3. 卡点 / 已知问题
 
@@ -235,6 +240,7 @@ kernel 存在（`lm_head_gemv_argmax_f16`）但注释说"目前输给 cuBLAS"，
 - [x] CPU prefill attention：手写 SSE2-标量 → gemm crate（AVX2-FMA）。attn 182→91ms/层（2×），prefill −34% @180s，180s RTFx +8%。零精度风险。单测 `prefill_attention_matches_reference`（见 §1.4）
 - [x] GPU conv stem permute：已是 GPU kernel `permute_bcft_to_btcf_f16`（kernels.cu，无 CPU detour）。此前文件头/ROADMAP 注释过时，已更正（§3.2）。
 - [x] GPU 全部 13 个集成测试通过
+- [x] **decode attention 短 context 用单 kernel**（cur_len ≤ 1024 不走 split，省 28 launches/step）。原"总是 split"是为已删的 CUDA Graph，2026-06-14 修正。15s RTFx 24.23→25.43（+5%）。cuBLAS GEMV 带宽 benchmark 确认 GEMV 已跑满 208GB/s（峰值），decode 余量在 launch 开销不在 GEMM 效率。
 - [x] CUDA Graph 死代码清理
 - [x] 脱离 burn 框架
 
@@ -268,8 +274,177 @@ kernel 存在（`lm_head_gemv_argmax_f16`）但注释说"目前输给 cuBLAS"，
 ### 5.5 不做
 
 - **CUDA Graph** — sm_61 不支持
-- **ROCm / Metal / Vulkan** — 已明确放弃，cudarc 专属
 - **回到 burn 框架** — 这次重构的目的就是脱离它
+- **wgpu / Vulkan 后端** — Intel iGPU Vulkan driver 对 f16 storage buffer 连续读取有 bug（device lost），详见 §5.6
+- **DirectML 后端** — GEMV 带宽只有 CUDA 的 1/4（P104 50.9 vs 200 GB/s），比 CPU INT8 还慢（Intel 核显）。技术上可行但性能不值得，详见 §5.6
+
+### 5.6 新后端：DirectML（Intel 核显 / 跨厂商 GPU 通用）— ❌ 性能不值得，已归档
+
+> **2026-06-14 最终结论（benchmark 实证）**：DirectML 技术上可行（f16 GEMM bit-exact 正确），但 **GEMM 性能不值得**。经 dispatch benchmark + 真实 lm_head 规模 GEMV 测量，DirectML 的 GEMM 带宽只有 CUDA 的 1/4（P104），比 CPU INT8 还慢（Intel 核显）。**不做正式后端**。保留 spike + benchmark 代码作为调研存档，避免未来重复探索。
+>
+> **关键 benchmark 数据（2026-06-14 实测，原 `dml_dispatch_bench.rs` 已随归档删除，数据留存此处）**：
+>
+> | 指标 | Intel 核显 (DirectML) | P104-100 (DirectML) | P104-100 (CUDA 现有) |
+> |---|---|---|---|
+> | dispatch overhead (batched) | 6.2µs | 11.2µs | ~5µs |
+> | lm_head GEMV (297MB) | **9.14ms** | **5.70ms** | ~3.75ms |
+> | GEMV 带宽 | **31.7 GB/s** | **50.9 GB/s** | ~200 GB/s |
+> | decode 预估 ms/tok | ~25ms | ~17ms | ~10ms |
+>
+> 根因：**DirectML 的 GEMM shader 远不如 cuBLAS 优化**。在 Pascal（老卡）上 DML 可能没用上最优 GEMM 实现。这不是 dispatch overhead 能解释的（overhead 只 2.8ms，compute 15ms+）。Intel 核显更糟 —— unified memory 带宽 ~80GB/s 但 DML 只跑到 31.7GB/s。
+>
+> **什么情况下值得重新评估**：(1) 有 Intel Arc 独显或 NPU（Intel AI Boost），DML 有专用加速；(2) DML GEMM 实现更新（目前 FL 5.0）；(3) 只需 CPU 卸载不在乎速度。
+
+---
+
+**探索过程存档（2026-06-14）**：用户有 Intel 核显设备（128MB ded + 18GB shared unified memory），计划未来支持 A 卡 + Metal。原 §5.5 "ROCm/Metal/Vulkan 已明确放弃" 已作废 —— 有第 3 个真实硬件目标，抽象有了依据。经过 wgpu → DirectML → benchmark 三轮实证，**三条路全部否决**（wgpu=driver bug，DirectML=性能不值得）。
+
+#### 探索过的三条路（实证结论）
+
+| 路 | GEMM bit-exact | 复杂算子 | 结论 |
+|---|---|---|---|
+| **wgpu / Vulkan** | ✅ Step 2 通过 | ❌ **qkv_extract device lost** | **否决**：Intel Vulkan driver 对 f16 storage buffer 连续读取有 bug，单 work-item 在循环里读多个连续 f16 元素即触发 device lost（30+ 轮二分定位，与 shared memory/reduction/rotary/uniform 布局全部无关，纯连续读取触发）|
+| **OpenCL** | 未 spike | — | **否决**：ocl crate 维护停滞；只覆盖 Intel 核显，A 卡仍需 ROCm 另写，未达成"一次写多后端"目标 |
+| **DirectML (DX12)** | ✅ **0/8192 mismatch, bit-exact** | ✅ GEMM operator 含同等复杂度 | **选定**：DML Feature Level 5.0 + FLOAT16 tensor 支持，算子级 API 绕过 driver bug |
+
+#### 选定 DirectML 的理由
+
+1. **f16 完整支持，无 driver bug**：DirectML 走 DX12 不走 Vulkan，避开了 Intel Vulkan 的 f16 连续读取 bug。`dml_probe` 确认 DML Feature Level 5.0（最高，远超 f16 需要的 4.0）+ `FLOAT16 tensor` 支持 = YES。
+2. **算子级 API 绕过 shader 手写**：你调 `DML_OPERATOR_GEMM`，DirectML 内部生成优化的 DX12 shader（Intel MetaCommand 加速），不碰 f16 读取细节。这和 cuBLAS 的哲学一致 —— GEMM 由厂商优化，你不写 kernel。
+3. **跨厂商**：DirectML 支持 Intel / AMD / NVIDIA（通过 DX12）。adapter 选择明确（DXGI vendor id 0x8086=Intel / 0x10de=NVIDIA / 0x1002=AMD），可运行时指定。
+4. **对称 cudarc**：`IDMLDevice` 对应 `CudaContext`，`DML_OPERATOR_GEMM` 对应 cuBLAS GEMM，`ID3D12Resource` 对应 `CudaSlice`，`IDMLCommandRecorder::RecordDispatch` 对应 kernel launch。
+5. **Rust 生态**：通过官方 `windows` crate（`Win32_AI_MachineLearning_DirectML` feature）访问，无额外依赖（wgpu 已经依赖 windows crate）。
+
+#### 已知约束
+
+- **不支持自定义融合 kernel**：DirectML 是算子级 API，现有的 `fused_gqa_decode`（attention 融合）、`qkv_extract`（norm+rotary+cache write 融合）必须**拆成独立算子调用**。这是架构性差异 —— DirectML 后端是"算子图调度"，不是"手写 kernel"。代价是更多 launch 开销 + 中间 buffer；收益是算子由厂商各自优化（Intel MetaCommand）。
+- **Windows only**：DirectML 只在 Windows 上可用（Mac/Linux 不支持）。但 CUDA 后端也是平台专属的，这不是新问题。
+- **GEMM 调用需 3 个输入**：`DML_GEMM_OPERATOR_DESC` 要求 bind A/B/C（即使 beta=0，CTensor residual 也必须 bind）。少了 C input 会输出全 0（已踩坑）。
+- **uniform buffer size**：DML 无此问题（wgpu/Vulkan 的坑，Intel 要求 ≥256 字节）。
+- **BF16 on disk → F16 in memory**：Qwen3-ASR 权重原生 BF16 存储，加载时转 F16（和现有 CPU/CUDA 路径一致，见 §2.1）。
+
+#### 对称映射表（实施对照）
+
+| 现有 CUDA | DirectML 后端 |
+|---|---|
+| `cudarc` crate | `windows` crate（`Win32_AI_MachineLearning_DirectML` feature）|
+| `CudaContext` / `CudaStream` | `ID3D12Device` / `ID3D12CommandQueue` |
+| `CudaSlice<f16>` | `ID3D12Resource`（Default/Upload/Readback heap）|
+| cuBLAS GEMM | `DML_OPERATOR_GEMM` |
+| 手写 CUDA kernel | `DML_OPERATOR_*`（算子库：ELEMENT_WISE / REDUCTION / ACTIVATION 等）|
+| `CudaFunction` + `LaunchConfig` | `IDMLCompiledOperator` + `IDMLCommandRecorder::RecordDispatch` |
+| `cudarc_engine.rs` | `directml_engine.rs`（新）|
+| `gpu_audio_encoder.rs` | `directml_audio_encoder.rs`（新）|
+| `kernels/kernels.cu` | **无**（用 DML 算子组合，不手写 shader）|
+| `feature = "cuda"` | `feature = "directml"` |
+| `Backend::Cuda` | `Backend::DirectML { adapter_index }` |
+| `Engine::Cuda {...}` | `Engine::DirectML {...}` |
+
+#### 算子映射（decode 路径）
+
+decode 每步的算子在 DirectML 里的对应（拆融合后的独立算子）：
+
+| decode 算子 | DirectML 实现 |
+|---|---|
+| GEMV (qkv/o/gate_up/down/lm_head) | `DML_OPERATOR_GEMM`（已验证 bit-exact ✅）|
+| RMSNorm | `DML_OPERATOR_REDUCE`（sum of squares）+ `ELEMENT_WISE_SQRT` + `ELEMENT_WISE_MULTIPLY` 组合；或 `DML_OPERATOR_MEAN_VARIANCE_NORMALIZATION`（若支持 RMS 模式）|
+| RoPE (rotary embedding) | `ELEMENT_WISE` 组合（cos/sin 表 + rotate half），无单算子 |
+| SiLU·up | `DML_OPERATOR_ACTIVATION_SIGMOID` + `ELEMENT_WISE_MULTIPLY`，或 `ACTIVATION_SILU` |
+| softmax (attention) | `DML_OPERATOR_ACTIVATION_SOFTMAX` |
+| argmax | `DML_OPERATOR_ARGMAX` |
+| embed lookup | `DML_OPERATOR_GATHER`（按 token id 取行）|
+| KV cache write | `DML_OPERATOR_COPY` 或直接 D3D12 `CopyBufferRegion` |
+
+#### 已验证的 spike 代码（保留在 examples/）
+
+- `examples/dml_probe.rs` — device 创建 + feature level 查询（DML FL 5.0 + f16）
+- `examples/dml_gemm_smoke.rs` — f16 GEMM 完整执行链路（0/8192 mismatch, 0.87ms）
+
+#### 实施顺序（正式后端）
+
+1. 加 `feature = "directml"`，把 `windows` crate 从 dev-dep 提为正式 dep（features: `Win32_Graphics_Dxgi` + `Win32_Graphics_Direct3D12` + `Win32_AI_MachineLearning_DirectML`）
+2. 写 `directml_engine.rs`：封装 D3D12 device/queue/fence + DML device/command recorder/binding table 的样板（dml_gemm_smoke.rs 的 setup 部分可提取）
+3. 移植 decode 算子链：先 GEMM（已验证）→ RMSNorm → SiLU → softmax → argmax → embed → RoPE → KV cache
+4. 端到端 decode N 步（CPU prefill 起点，与 CPU 参考 token 对比）→ 测 ms/token
+5. go/no-go：对比 CPU INT8（~3-6ms/tok）和 CUDA（~10ms/tok）基线
+6. 若 go：接入 `Engine::DirectML` arm + `Backend::DirectML`，移植音频编码器
+
+**关键风险**：拆融合 kernel 后的 launch 开销。DirectML 每个算子是一次 dispatch（RecordDispatch），decode 每步 28 层 × ~9 算子 = ~252 dispatches/step。如果每 dispatch 有固定开销（~10µs），仅 overhead 就 ~2.5ms/tok。需要实测。这是 DirectML 相比手写 CUDA kernel 的最大不确定性。
+
+#### 正式后端实施规划（2026-06-14）
+
+**接入点**（对称现有 CUDA 后端的 cfg 模式）：
+
+```toml
+# Cargo.toml
+[features]
+default = ["cuda"]
+cuda = ["dep:cudarc"]
+directml = ["dep:windows"]  # 新增
+```
+```rust
+// src/backend.rs
+pub enum Backend {
+    Auto,
+    Cpu,
+    #[cfg(feature = "cuda")] Cuda,
+    #[cfg(feature = "directml")] DirectML { adapter_vendor_id: Option<u32> }, // None=Auto, Some(0x8086)=Intel
+}
+pub(crate) enum ResolvedBackend {
+    Cpu,
+    #[cfg(feature = "cuda")] Cuda(Arc<CudaState>),
+    #[cfg(feature = "directml")] DirectML(Arc<DmlState>),  // 新增
+}
+// src/inference.rs
+pub(crate) enum Engine {
+    Cpu { decoder, audio_encoder },
+    #[cfg(feature = "cuda")] Cuda { cuda, decoder, audio_encoder },
+    #[cfg(feature = "directml")] DirectML { dml: Arc<DmlState>, decoder: DmlTextDecoder, audio_encoder: DmlAudioEncoder },
+}
+```
+
+**`windows` crate 从 dev-dep 提为正式 dep**（只在 `directml` feature 下）。需要的 features（实测）：
+```
+Win32_Graphics_Dxgi + Win32_Graphics_Dxgi_Common + Win32_Graphics_Direct3D +
+Win32_Graphics_Direct3D12 + Win32_System_Threading + Win32_Security +
+Win32_AI_MachineLearning_DirectML
+```
+（`Win32_Security` 是 `CreateEventW` 的 gate，`Win32_System_Threading` 是 fence event 的，`Win32_Graphics_Direct3D` 是 `D3D_FEATURE_LEVEL` 的。）
+
+**新增文件**：
+- `src/directml_engine.rs` — DML 设备封装（D3D12 device/queue/fence + DML device/command recorder/descriptor heap/binding table 的样板，可从 `dml_gemm_smoke.rs` 提取）+ DML 算子调度器（封装 create+compile+bind+dispatch 序列）
+- `src/directml_audio_encoder.rs` — 音频编码器（后期，conv stem + transformer 用 DML 算子组合）
+
+**decode 算子实现的优先级 + 难度**（已按依赖排序）：
+
+| 算子 | DML 实现 | 难度 | 备注 |
+|---|---|---|---|
+| GEMM | `DML_OPERATOR_GEMM` | ✅ 已验证 | decode 用 GEMV-shaped（m=1），prefill 用真 GEMM |
+| RMSNorm | `DML_OPERATOR_REDUCE`(L2) + `ELEMENT_WISE_*` 组合 | 中 | DML 无原生 RMSNorm，需 3-4 算子组合；或试 `MEAN_VARIANCE_NORMALIZATION` |
+| SiLU·up | `DML_OPERATOR_ACTIVATION_SIGMOID` + `ELEMENT_WISE_MULTIPLY` | 低 | 或 `ACTIVATION_SILU` 直接有 |
+| softmax | `DML_OPERATOR_ACTIVATION_SOFTMAX` | 低 | 原生支持 |
+| argmax | `DML_OPERATOR_ARGMAX` | 低 | 原生支持 |
+| embed lookup | `DML_OPERATOR_GATHER` | 低 | 按 token id 取行 |
+| RoPE | `ELEMENT_WISE` 组合（cos/sin 表 + rotate half） | 中-高 | 无单算子，需 ~5 个 element-wise 组合 |
+| KV cache write | `DML_OPERATOR_COPY` 或 D3D12 `CopyBufferRegion` | 低 | 不用 DML，直接 D3D12 拷贝 |
+
+**最大风险点（必须早期验证）**：
+- **launch 开销**：252 dispatches/step 是否可接受？建议**先只移植 GEMM + 一个 element-wise**，跑 decode 几步测 dispatch 开销，再决定是否继续
+- **RMSNorm 组合**：DML 无原生 RMSNorm，组合多个算子可能比手写慢。若 RMSNorm 太慢，考虑保留它在 CPU（混合后端）
+- **RoPE**：5 个 element-wise 算子组合，可能成为瓶颈
+
+**建议的实施顺序（风险驱动）**：
+1. 先把 `dml_gemm_smoke.rs` 的 D3D12/DML setup 提取成 `directml_engine.rs` 的 `DmlState`（reusable context）
+2. 实现 decode 算子里**最简单的 3 个**（GEMM + SiLU + softmax），跑一个"只含这 3 个"的假 decode 循环，测 **dispatch 开销基线**
+3. 如果 dispatch 开销可接受（< 1ms/tok），继续移植 RMSNorm + RoPE + argmax + embed
+4. 跑端到端 decode，对比 CPU/CUDA
+5. go/no-go 后再决定是否接 audio encoder
+
+**不做**（明确排除，避免范围蔓延）：
+- ❌ 不做 DML 算子图融合（DML graph API 复杂，收益不确定）
+- ❌ 不做 INT8 量化（DML 路径 f16，和 CPU INT8 是不同优化轴）
+- ❌ 不做 prefill（先用 CPU prefill 当起点，DML 只跑 decode；prefill 后期再加）
+- ❌ 不做 streaming（先验证核心 decode）
 
 ## 6. 一些不能忘的事实
 
