@@ -7,6 +7,11 @@ license = "MIT"
 
 [dependencies]
 half = { version = "2" }
+# mmap + zero-copy slice for safetensors weight loading (weights.rs). bytes is
+# pinned to >=1.11: Bytes::from_owner landed in 1.9, and 1.11 fixed a to_vec
+# memory-leak (#773) that the older from_owner path could trigger.
+memmap2 = "0.9"
+bytes = "1.11"
 cudarc = { version = "0.19", features = ["cublas", "f16", "cuda-version-from-build-system", "cuda-12080"], optional = true }
 # gemm + rayon power the CPU-only text-decoder engine (cpu_engine.rs).  We drive them
 # directly so we can force Rayon parallelism on the m=1 GEMVs that typical GEMM thresholds
