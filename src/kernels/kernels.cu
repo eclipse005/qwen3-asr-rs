@@ -962,7 +962,7 @@ fused_gqa_decode_f16(
 // Phase 2: each block handles one (b, nqh) — reads N chunks of (max, sum, partial_out),
 // merges with online-softmax correction, writes final out.
 
-extern "C" __global__ void __launch_bounds__(256, 4)
+extern "C" __global__ void
 fused_gqa_decode_split_p1_f16(
     float* __restrict__ part_out,       // [b, nqh, NCHUNKS, d]   (float for accumulation)
     float* __restrict__ part_max,       // [b, nqh, NCHUNKS]
