@@ -1,6 +1,8 @@
 # qwen3-asr-rs
 
-[Qwen3-ASR](https://github.com/QwenLM/Qwen3) 的 Rust 推理库。支持 CUDA 和 CPU 双后端，零深度学习框架依赖。
+[Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) 的 Rust 推理库。支持 CUDA 和 CPU 双后端，零深度学习框架依赖。
+
+Qwen3-ASR 是阿里通义千问开源的语音识别模型，支持 52 种语言和方言，提供 0.6B 和 1.7B 两种规格。
 
 ## 安装
 
