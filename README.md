@@ -1,15 +1,21 @@
 # qwen3-asr-rs
 
-[Qwen3-ASR](https://github.com/QwenLM/Qwen3) 的纯 Rust 推理库，手写 CUDA + CPU 双后端，零深度学习框架依赖。
+[Qwen3-ASR](https://github.com/QwenLM/Qwen3) 的 Rust 推理库。支持 CUDA 和 CPU 双后端，零深度学习框架依赖。
 
-## 特性
+## 安装
 
-- **双后端**：CUDA（cuBLAS + NVRTC 手写 kernel）和 CPU（gemm + rayon），运行时切换
-- **零拷贝权重加载**：mmap safetensors
-- **流式识别**：支持 chunk-by-chunk 流式推理
-- **确定性输出**：同输入多次运行逐 token 一致
+```toml
+[dependencies]
+qwen3-asr = { git = "https://github.com/eclipse005/qwen3-asr-rs.git" }
+```
 
-## 快速开始
+CPU-only 构建：
+
+```toml
+qwen3-asr = { git = "https://github.com/eclipse005/qwen3-asr-rs.git", default-features = false }
+```
+
+## 使用
 
 ```rust
 use qwen3_asr::{Backend, AsrInference, TranscribeOptions};
@@ -20,22 +26,20 @@ let result = infer.transcribe("audio.wav", TranscribeOptions::default())?;
 println!("{}", result.text);
 ```
 
-## Features
-
-```toml
-default = ["cuda"]      # CUDA + CPU 都编译进来
-cuda = ["dep:cudarc"]   # CUDA 后端
-cpu  = []               # CPU 后端（总是可用）
-hub  = ["dep:reqwest"]  # HuggingFace Hub 下载
-```
-
-CPU-only 构建：`cargo build --no-default-features --features cpu`
-
 ## 模型下载
 
-从 HuggingFace 下载：
+从 HuggingFace 下载 safetensors 格式的模型：
+
 - [Qwen/Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B)
 - [Qwen/Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B)
+
+## Features
+
+| Feature | 说明 |
+|---------|------|
+| `cuda`（默认） | CUDA 后端，需要 CUDA 12.8+ |
+| `cpu` | CPU 后端，始终可用 |
+| `hub` | HuggingFace Hub 自动下载 |
 
 ## License
 
