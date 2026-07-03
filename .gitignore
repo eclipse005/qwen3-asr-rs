@@ -18,3 +18,7 @@
 # Logs / autotune cache
 *.log
 /autotune
+
+# Test audio / output (local-only, regenerated)
+*.wav
+asr_test_output.txt
