@@ -43,6 +43,43 @@ println!("{}", result.text);
 | `cpu` | CPU 后端，始终可用 |
 | `hub` | HuggingFace Hub 自动下载 |
 
+## Benchmark
+
+在 NVIDIA P104-100（8 GiB）上，使用 `tests/fixtures` 中的音频对比 Rust 实现与 Python 原版（`qwen-asr` transformers backend）的 CUDA 性能。
+
+| 模型 | 音频 | Rust 耗时 | Rust RTFx | Rust 显存峰值 | Python 耗时 | Python RTFx | Python 显存峰值 | Rust 加速比 |
+|------|------|-----------|-----------|---------------|-------------|-------------|-----------------|-------------|
+| 0.6B | 15s.wav | 0.63s | 23.90x | 1913 MiB | 3.61s | 4.15x | 1943 MiB | 5.75x |
+| 0.6B | 30s.wav | 1.82s | 16.52x | 2105 MiB | 6.37s | 4.71x | 1969 MiB | 3.51x |
+| 0.6B | 90s.wav | 5.49s | 16.39x | 2841 MiB | 17.89s | 5.03x | 2515 MiB | 3.26x |
+| 0.6B | ja_89s.wav | 5.05s | 17.63x | 2841 MiB | 15.01s | 5.93x | 2513 MiB | 2.97x |
+| 0.6B | 180s.wav | 12.51s | 14.39x | 3993 MiB | 40.58s | 4.44x | 3645 MiB | 3.24x |
+| 0.6B | 180s_en.wav | 11.64s | 15.46x | 3961 MiB | 36.37s | 4.95x | 3615 MiB | 3.12x |
+| 1.7B | 15s.wav | 1.65s | 9.07x | 4313 MiB | 4.12s | 3.64x | 4631 MiB | 2.49x |
+| 1.7B | 30s.wav | 3.77s | 7.97x | 4505 MiB | 7.09s | 4.23x | 4663 MiB | 1.88x |
+| 1.7B | 90s.wav | 10.43s | 8.63x | 5241 MiB | 23.16s | 3.89x | 4937 MiB | 2.22x |
+| 1.7B | ja_89s.wav | 9.04s | 9.85x | 5241 MiB | 20.71s | 4.30x | 5031 MiB | 2.29x |
+| 1.7B | 180s.wav | 22.55s | 7.98x | 6393 MiB | 51.21s | 3.52x | 6233 MiB | 2.27x |
+| 1.7B | 180s_en.wav | 21.07s | 8.54x | 6329 MiB | 47.83s | 3.76x | 6197 MiB | 2.27x |
+
+结论：Rust 实现全面快于 Python 原版，0.6B 约 3–6 倍，1.7B 约 2–2.5 倍；显存占用两者相当。
+
+运行方式：
+
+```bash
+# Rust
+cargo test --release --test bench_cuda -- --ignored --test-threads=1
+
+# Python（需要 conda activate asr）
+conda activate asr
+python scripts/bench_original.py
+
+# 生成对比报告
+python scripts/summarize_bench.py target/rust_bench_cuda_v2.tsv target/python_bench_original_v2.tsv
+```
+
+详细日志和 TSV 数据保存在 `target/` 目录下。
+
 ## License
 
 MIT
