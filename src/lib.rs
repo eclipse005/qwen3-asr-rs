@@ -14,6 +14,8 @@ mod weights;
 mod cudarc_engine;
 #[cfg(feature = "cuda")]
 mod gpu_audio_encoder;
+#[cfg(feature = "cuda")]
+mod prebuilt_ptx;
 mod cpu_engine;
 mod cpu_audio_encoder;
 
