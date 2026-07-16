@@ -30,10 +30,15 @@ println!("{}", result.text);
 
 ## 模型下载
 
-从 HuggingFace 下载 safetensors 格式的模型：
+从 HuggingFace 下载 safetensors 格式的模型（权重版权归原作者）：
 
 - [Qwen/Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B)
 - [Qwen/Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B)
+
+官方项目与文档：
+
+- 代码与说明：[QwenLM/Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR)
+- 模型集合：[Qwen3-ASR on Hugging Face](https://huggingface.co/collections/Qwen/qwen3-asr)
 
 ## Features
 
@@ -79,6 +84,17 @@ python scripts/summarize_bench.py target/rust_bench_cuda_v2.tsv target/python_be
 ```
 
 详细日志和 TSV 数据保存在 `target/` 目录下。
+
+## 致谢 / 原版出处
+
+本仓库是 **独立的 Rust 推理实现**，用于加载并运行官方发布的 Qwen3-ASR 权重；**不是** Alibaba / Qwen 官方发行版，与原作者无隶属关系。
+
+| 组件 | 原版 | 链接 | 协议（以官方页面为准） |
+|------|------|------|------------------------|
+| 模型权重 | Qwen3-ASR 0.6B / 1.7B | [HF 0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) · [HF 1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) | Apache-2.0 |
+| 官方推理与文档 | Qwen3-ASR | [QwenLM/Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) | Apache-2.0 |
+
+使用模型权重时请遵守原作者许可证；本仓库的 Rust 推理代码以本仓库 License 为准。
 
 ## License
 
