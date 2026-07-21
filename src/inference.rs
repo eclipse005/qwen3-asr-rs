@@ -30,7 +30,15 @@ pub struct TranscribeOptions {
 }
 
 impl Default for TranscribeOptions {
-    fn default() -> Self { Self { language: None, max_new_tokens: 512 } }
+    /// Default `max_new_tokens` matches common product / transformers use (2048).
+    /// Generation must stop on EOS like HF `generate`; do not rely on decode-time
+    /// n-gram early-stop or lowered token ceilings as the primary control.
+    fn default() -> Self {
+        Self {
+            language: None,
+            max_new_tokens: 2048,
+        }
+    }
 }
 
 impl TranscribeOptions {
@@ -366,7 +374,9 @@ impl AsrInferenceInner {
 
         let t_decode = std::time::Instant::now();
         for _step in 0..max_new_tokens {
-            if eos_ids.contains(&next_token) { break; }
+            if eos_ids.contains(&next_token) {
+                break;
+            }
             generated_ids.push(next_token as u32);
             on_token(next_token as u32);
 
@@ -458,10 +468,14 @@ impl AsrInferenceInner {
 
         let t_decode = std::time::Instant::now();
         loop {
-            if eos_ids.contains(&next_token) { break; }
+            if eos_ids.contains(&next_token) {
+                break;
+            }
             generated_ids.push(next_token as u32);
             on_token(next_token as u32);
-            if generated_ids.len() >= max_new_tokens { break; }
+            if generated_ids.len() >= max_new_tokens {
+                break;
+            }
 
             cuda.embed_id_from_gpu_slot_into(&decoder.embed_table, &token_buf, 0, &mut h_buf)?;
             decoder.forward_decode_scratch(

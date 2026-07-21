@@ -1238,35 +1238,49 @@ impl CudaState {
     }
 
     /// fused_gqa_decode_split writing into pre-allocated partial + output buffers.
-    /// `max_chunks` is the fixed grid y-dimension (upper bound for graph stability).
+    ///
+    /// Grid y-dim MUST be `n_chunks` (not a larger max_chunks). The p1 kernel indexes
+    /// partials as `head * n_chunks + by`. Launching `by >= n_chunks` with that stride
+    /// overwrites the next head's slots → non-deterministic / corrupted long-context
+    /// attention (exactly the ASR prefill+decode path where cur_len > 1024).
+    /// `max_chunks` only sizes the preallocated scratch; it is not a launch dimension.
     pub fn fused_gqa_decode_split_into(&self, q: &CudaSlice<f16>,
         k_cache: &CudaSlice<f16>, v_cache: &CudaSlice<f16>,
-        nkvh: usize, max_seq: usize, cur_len: usize, scale: f32, chunk_size: usize, max_chunks: usize,
+        nqh: usize, nkvh: usize, max_seq: usize, cur_len: usize, scale: f32, chunk_size: usize,
         part_out: &mut CudaSlice<f32>, part_max: &mut CudaSlice<f32>, part_sum: &mut CudaSlice<f32>,
         out: &mut CudaSlice<f16>,
     ) -> Result<()> {
         let n_chunks = (cur_len + chunk_size - 1) / chunk_size;
+        let d = 128usize;
         let bs: u32 = 256;
-        let t_split = (bs as usize / 128).max(1);
-        let smem_bytes = (chunk_size + 128 * t_split) * 4;
+        let t_split = (bs as usize / d).max(1);
+        let smem_bytes = (chunk_size + d * t_split) * 4;
         {
-            // Grid y-dim uses max_chunks for stable topology; kernel handles excess chunks
-            let cfg = LaunchConfig { grid_dim: (16, max_chunks as u32, 1), block_dim: (bs, 1, 1), shared_mem_bytes: smem_bytes as u32 };
-            let nkvh_i = nkvh as i32; let max_i = max_seq as i32; let d_i = 128i32;
-            let cur_i = cur_len as i32; let cs_i = chunk_size as i32; let nc_i = n_chunks as i32;
+            let cfg = LaunchConfig {
+                grid_dim: (nqh as u32, n_chunks as u32, 1),
+                block_dim: (bs, 1, 1),
+                shared_mem_bytes: smem_bytes as u32,
+            };
+            let nqh_i = nqh as i32; let nkvh_i = nkvh as i32; let max_i = max_seq as i32;
+            let d_i = d as i32; let cur_i = cur_len as i32; let cs_i = chunk_size as i32;
+            let nc_i = n_chunks as i32;
             let mut bb = self.stream.launch_builder(&self.k.fused_gqa_decode_split_p1);
             bb.arg(&mut *part_out); bb.arg(&mut *part_max); bb.arg(&mut *part_sum);
             bb.arg(q); bb.arg(k_cache); bb.arg(v_cache);
-            bb.arg(&1i32); bb.arg(&16i32); bb.arg(&nkvh_i); bb.arg(&max_i); bb.arg(&d_i);
+            bb.arg(&1i32); bb.arg(&nqh_i); bb.arg(&nkvh_i); bb.arg(&max_i); bb.arg(&d_i);
             bb.arg(&cur_i); bb.arg(&cs_i); bb.arg(&nc_i); bb.arg(&scale);
             unsafe { bb.launch(cfg) }?;
         }
         {
-            let cfg = LaunchConfig { grid_dim: (16, 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
-            let nc_i = n_chunks as i32;
+            let cfg = LaunchConfig {
+                grid_dim: (nqh as u32, 1, 1),
+                block_dim: (d as u32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let nqh_i = nqh as i32; let nc_i = n_chunks as i32; let d_i = d as i32;
             let mut bb = self.stream.launch_builder(&self.k.fused_gqa_decode_split_p2);
             bb.arg(out); bb.arg(&*part_out); bb.arg(&*part_max); bb.arg(&*part_sum);
-            bb.arg(&1i32); bb.arg(&16i32); bb.arg(&nc_i); bb.arg(&128i32);
+            bb.arg(&1i32); bb.arg(&nqh_i); bb.arg(&nc_i); bb.arg(&d_i);
             unsafe { bb.launch(cfg) }?;
         }
         Ok(())
@@ -1468,10 +1482,9 @@ impl GpuDecoderLayer {
             )?;
         } else {
             let chunk_size: usize = if cur_len >= 2048 { 512 } else { 256 };
-            let max_chunks = (kv.max_seq + 255) / 256;
             cuda.fused_gqa_decode_split_into(
                 &scratch.q_out, &kv.k[layer_idx], &kv.v[layer_idx],
-                self.nkvh, kv.max_seq, cur_len, scale, chunk_size, max_chunks,
+                self.nqh, self.nkvh, kv.max_seq, cur_len, scale, chunk_size,
                 &mut scratch.split_part_out, &mut scratch.split_part_max, &mut scratch.split_part_sum,
                 &mut scratch.attn_out,
             )?;
