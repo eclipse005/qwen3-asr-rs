@@ -93,7 +93,8 @@ impl<'a> AsrStreamingSession<'a> {
         options: TranscribeOptions,
     ) -> Self {
         let state = match &inner.engine {
-            Engine::Cpu { audio_encoder, .. } => {
+            Engine::Cpu(pipeline) => {
+                let audio_encoder = &pipeline.audio_encoder;
                 let cfg = &audio_encoder.config();
                 let cs = cfg.n_window * 2;
                 let tpc = feo(cs);
@@ -116,7 +117,8 @@ impl<'a> AsrStreamingSession<'a> {
                 })
             }
             #[cfg(feature = "cuda")]
-            Engine::Cuda { audio_encoder, .. } => {
+            Engine::Cuda(pipeline) => {
+                let audio_encoder = &pipeline.audio_encoder;
                 let cfg = audio_encoder.config();
                 let cs = cfg.n_window * 2;
                 let tpc = gpu_feo(cs);

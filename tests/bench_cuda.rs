@@ -140,39 +140,39 @@ fn run_bench(model_name: &str, model_dir: &str, wav: &str, duration_s: f32, max_
 // 0.6B model benches
 #[test]
 #[ignore]
-fn test_q06_15s()      { run_bench("0.6B", &model_dir_06(), "15s.wav",      15.0,  512); }
+fn test_q06_15s_en()   { run_bench("0.6B", &model_dir_06(), "15s_en.wav",  15.0,  512); }
 #[test]
 #[ignore]
-fn test_q06_30s()      { run_bench("0.6B", &model_dir_06(), "30s.wav",      30.0,  512); }
+fn test_q06_30s_zh()   { run_bench("0.6B", &model_dir_06(), "30s_zh.wav",  30.0,  512); }
 #[test]
 #[ignore]
-fn test_q06_90s()      { run_bench("0.6B", &model_dir_06(), "90s.wav",      90.0,  1024); }
+fn test_q06_90s_en()   { run_bench("0.6B", &model_dir_06(), "90s_en.wav",  90.0,  1024); }
 #[test]
 #[ignore]
-fn test_q06_89s_ja()   { run_bench("0.6B", &model_dir_06(), "ja_89s.wav",   89.0,  1024); }
+fn test_q06_90s_ja()   { run_bench("0.6B", &model_dir_06(), "90s_ja.wav",  89.0,  1024); }
 #[test]
 #[ignore]
-fn test_q06_180s()     { run_bench("0.6B", &model_dir_06(), "180s.wav",    180.0,  1024); }
+fn test_q06_180s_zh()  { run_bench("0.6B", &model_dir_06(), "180s_zh.wav", 180.0, 1024); }
 #[test]
 #[ignore]
-fn test_q06_180s_en()  { run_bench("0.6B", &model_dir_06(), "180s_en.wav", 180.0,  1024); }
+fn test_q06_180s_en()  { run_bench("0.6B", &model_dir_06(), "180s_en.wav", 180.0, 1024); }
 
 // 1.7B model benches
 #[test]
 #[ignore]
-fn test_q17_15s()      { run_bench("1.7B", &model_dir_17(), "15s.wav",      15.0,  512); }
+fn test_q17_15s_en()   { run_bench("1.7B", &model_dir_17(), "15s_en.wav",  15.0,  512); }
 #[test]
 #[ignore]
-fn test_q17_30s()      { run_bench("1.7B", &model_dir_17(), "30s.wav",      30.0,  512); }
+fn test_q17_30s_zh()   { run_bench("1.7B", &model_dir_17(), "30s_zh.wav",  30.0,  512); }
 #[test]
 #[ignore]
-fn test_q17_90s()      { run_bench("1.7B", &model_dir_17(), "90s.wav",      90.0,  1024); }
+fn test_q17_90s_en()   { run_bench("1.7B", &model_dir_17(), "90s_en.wav",  90.0,  1024); }
 #[test]
 #[ignore]
-fn test_q17_89s_ja()   { run_bench("1.7B", &model_dir_17(), "ja_89s.wav",   89.0,  1024); }
+fn test_q17_90s_ja()   { run_bench("1.7B", &model_dir_17(), "90s_ja.wav",  89.0,  1024); }
 #[test]
 #[ignore]
-fn test_q17_180s()     { run_bench("1.7B", &model_dir_17(), "180s.wav",    180.0,  1024); }
+fn test_q17_180s_zh()  { run_bench("1.7B", &model_dir_17(), "180s_zh.wav", 180.0, 1024); }
 #[test]
 #[ignore]
-fn test_q17_180s_en()  { run_bench("1.7B", &model_dir_17(), "180s_en.wav", 180.0,  1024); }
+fn test_q17_180s_en()  { run_bench("1.7B", &model_dir_17(), "180s_en.wav", 180.0, 1024); }

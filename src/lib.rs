@@ -7,6 +7,8 @@ mod inference;
 mod mel;
 pub(crate) mod raw_tensor;
 mod mrope;
+/// Backend pipelines (CPU / CUDA / future HIP·Metal): stage-level abstraction.
+mod pipeline;
 mod prompt;
 mod streaming;
 mod weights;

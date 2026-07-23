@@ -1,0 +1,9 @@
+backend: cpu
+model: 1.7B
+wav: 15s_en.wav
+audio_s: 15.000
+elapsed_s: 7.194
+rtfx: 2.085
+detected_language: English
+
+All right, peeps. Welcome everyone into this crash course about our new 15-minute time frame entry models and strategy. If you are here, it means you have already completed the four hours swing trading strategy. So congratulations on reaching this.

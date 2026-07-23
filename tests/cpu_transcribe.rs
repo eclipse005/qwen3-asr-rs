@@ -100,24 +100,23 @@ fn run_cpu(name: &str, wav: &str, duration_s: f32) {
     run_cpu_with(name, &model_dir_06(), wav, duration_s, 512);
 }
 
-#[test] fn test_cpu_sample1()   { run_cpu("sample1",   "sample1.wav",   0.0); }
-#[test] fn test_cpu_15s()      { run_cpu("15s",       "15s.wav",      15.0); }
-#[test] fn test_cpu_30s()      { run_cpu("30s",       "30s.wav",      30.0); }
-#[test] fn test_cpu_90s()      { run_cpu("90s",       "90s.wav",      90.0); }
-#[test] fn test_cpu_89s_ja()   { run_cpu("89s_ja",    "ja_89s.wav",   89.0); }
-#[test] fn test_cpu_180s()     { run_cpu("180s",      "180s.wav",    180.0); }
-#[test] fn test_cpu_180s_en()  { run_cpu("180s_en",   "180s_en.wav", 180.0); }
+#[test] fn test_cpu_15s_en()   { run_cpu("15s_en",   "15s_en.wav",  15.0); }
+#[test] fn test_cpu_30s_zh()   { run_cpu("30s_zh",   "30s_zh.wav",  30.0); }
+#[test] fn test_cpu_90s_en()   { run_cpu("90s_en",   "90s_en.wav",  90.0); }
+#[test] fn test_cpu_90s_ja()   { run_cpu("90s_ja",   "90s_ja.wav",  89.0); }
+#[test] fn test_cpu_180s_zh()  { run_cpu("180s_zh",  "180s_zh.wav", 180.0); }
+#[test] fn test_cpu_180s_en()  { run_cpu("180s_en",  "180s_en.wav", 180.0); }
 
 // 1.7B CPU baseline — mirror CUDA test_q17_* config (long fixtures bump max_new_tokens to 1024).
 fn run_cpu_17(name: &str, wav: &str, duration_s: f32, max_new_tokens: usize) {
     run_cpu_with(name, &model_dir_17(), wav, duration_s, max_new_tokens);
 }
 
-#[test] fn test_cpu_17_15s()     { run_cpu_17("1.7B-15s",     "15s.wav",      15.0,  512); }
-#[test] fn test_cpu_17_30s()     { run_cpu_17("1.7B-30s",     "30s.wav",      30.0,  512); }
-#[test] fn test_cpu_17_90s()     { run_cpu_17("1.7B-90s",     "90s.wav",      90.0, 1024); }
-#[test] fn test_cpu_17_89s_ja()  { run_cpu_17("1.7B-89s_ja",  "ja_89s.wav",   89.0, 1024); }
-#[test] fn test_cpu_17_180s()    { run_cpu_17("1.7B-180s",    "180s.wav",    180.0, 1024); }
+#[test] fn test_cpu_17_15s_en()  { run_cpu_17("1.7B-15s_en",  "15s_en.wav",  15.0,  512); }
+#[test] fn test_cpu_17_30s_zh()  { run_cpu_17("1.7B-30s_zh",  "30s_zh.wav",  30.0,  512); }
+#[test] fn test_cpu_17_90s_en()  { run_cpu_17("1.7B-90s_en",  "90s_en.wav",  90.0, 1024); }
+#[test] fn test_cpu_17_90s_ja()  { run_cpu_17("1.7B-90s_ja",  "90s_ja.wav",  89.0, 1024); }
+#[test] fn test_cpu_17_180s_zh() { run_cpu_17("1.7B-180s_zh", "180s_zh.wav", 180.0, 1024); }
 #[test] fn test_cpu_17_180s_en() { run_cpu_17("1.7B-180s_en", "180s_en.wav", 180.0, 1024); }
 
 /// Verify streaming produces identical final result as non-streaming.
@@ -128,7 +127,7 @@ fn test_cpu_streaming_matches_nonstreaming() {
     ).expect("load 0.6B CPU");
 
     let options = qwen3_asr::TranscribeOptions::default();
-    let wav = fixture("sample1.wav");
+    let wav = fixture("15s_en.wav");
 
     // Non-streaming baseline
     let baseline = engine.transcribe(&wav, qwen3_asr::TranscribeOptions::default())
@@ -174,7 +173,7 @@ fn test_cpu_streaming_visual_90s() {
         std::path::Path::new(&model_dir_06()), qwen3_asr::Backend::Cpu,
     ).expect("load 0.6B CPU");
 
-    let wav = fixture("90s.wav");
+    let wav = fixture("90s_en.wav");
     let options = qwen3_asr::TranscribeOptions::default();
 
     println!("\n═══ Streaming 90s English (typewriter) ═══\n");
@@ -212,11 +211,11 @@ fn test_cpu_streaming_session_90s() {
 
     // Baseline
     let baseline = engine.transcribe(
-        &fixture("90s.wav"), qwen3_asr::TranscribeOptions::default(),
+        &fixture("90s_en.wav"), qwen3_asr::TranscribeOptions::default(),
     ).expect("baseline transcribe");
 
     // Session: feed 1s chunks
-    let samples = qwen3_asr::load_audio_wav(&fixture("90s.wav"), 16000).expect("load wav");
+    let samples = qwen3_asr::load_audio_wav(&fixture("90s_en.wav"), 16000).expect("load wav");
 
     let mut session = engine.create_streaming_session(
         qwen3_asr::TranscribeOptions::default(),

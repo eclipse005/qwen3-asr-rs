@@ -21,4 +21,6 @@
 
 # Test audio / output (local-only, regenerated)
 *.wav
+# Keep language-tagged fixtures tracked (force-add historically; allowlist here).
+!tests/fixtures/*.wav
 asr_test_output.txt

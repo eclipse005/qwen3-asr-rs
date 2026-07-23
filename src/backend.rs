@@ -1,8 +1,9 @@
 //! Backend selection — pure tag enum, no internal types.
 //!
 //! `Backend` is a lightweight selection tag.  Pass it to [`AsrInference::load`]
-//! to choose CPU or GPU.  The heavy lifting lives in `cudarc_engine` (GPU) and
-//! `cpu_engine` (CPU); this module just owns the dispatch.
+//! to choose a compute backend.  CPU and CUDA are equal peers; each implements
+//! [`crate::pipeline::AsrPipeline`] (encode + generate).  Future HIP / Metal /
+//! DirectML backends plug in the same way without changing the public API.
 
 #[cfg(feature = "cuda")]
 use std::sync::Arc;

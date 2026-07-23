@@ -47,7 +47,7 @@ fn test_q06_sample1() {
     ).expect("load 0.6B");
 
     let result = engine.transcribe(
-        &fixture("sample1.wav"),
+        &fixture("15s_en.wav"),
         qwen3_asr::TranscribeOptions::default(),
     ).expect("transcribe");
 
@@ -77,7 +77,7 @@ fn test_q06_15s() {
 
     let t0 = Instant::now();
     let result = engine.transcribe(
-        &fixture("15s.wav"),
+        &fixture("15s_en.wav"),
         qwen3_asr::TranscribeOptions::default(),
     ).expect("transcribe");
     let elapsed = t0.elapsed().as_secs_f32();
@@ -102,7 +102,7 @@ fn test_q06_30s() {
 
     let t0 = Instant::now();
     let result = engine.transcribe(
-        &fixture("30s.wav"),
+        &fixture("30s_zh.wav"),
         qwen3_asr::TranscribeOptions::default(),
     ).expect("transcribe");
     let elapsed = t0.elapsed().as_secs_f32();
@@ -127,7 +127,7 @@ fn test_q17_15s() {
 
     let t0 = Instant::now();
     let result = engine.transcribe(
-        &fixture("15s.wav"),
+        &fixture("15s_en.wav"),
         qwen3_asr::TranscribeOptions::default(),
     ).expect("transcribe");
     let elapsed = t0.elapsed().as_secs_f32();
@@ -152,7 +152,7 @@ fn test_q17_30s() {
 
     let t0 = Instant::now();
     let result = engine.transcribe(
-        &fixture("30s.wav"),
+        &fixture("30s_zh.wav"),
         qwen3_asr::TranscribeOptions::default(),
     ).expect("transcribe");
     let elapsed = t0.elapsed().as_secs_f32();
@@ -175,7 +175,7 @@ fn test_q06_90s() {
     ).expect("load 0.6B");
     let t0 = std::time::Instant::now();
     let result = engine.transcribe(
-        &fixture("90s.wav"),
+        &fixture("90s_en.wav"),
         qwen3_asr::TranscribeOptions::default(),
     ).expect("transcribe");
     let elapsed = t0.elapsed().as_secs_f32();
@@ -195,7 +195,7 @@ fn test_q06_89s_ja() {
     ).expect("load 0.6B");
     let t0 = std::time::Instant::now();
     let result = engine.transcribe(
-        &fixture("ja_89s.wav"),
+        &fixture("90s_ja.wav"),
         qwen3_asr::TranscribeOptions::default().with_max_new_tokens(1024),
     ).expect("transcribe");
     let elapsed = t0.elapsed().as_secs_f32();
@@ -216,7 +216,7 @@ fn test_q17_89s_ja() {
     ).expect("load 1.7B");
     let t0 = std::time::Instant::now();
     let result = engine.transcribe(
-        &fixture("ja_89s.wav"),
+        &fixture("90s_ja.wav"),
         qwen3_asr::TranscribeOptions::default().with_max_new_tokens(1024),
     ).expect("transcribe");
     let elapsed = t0.elapsed().as_secs_f32();
@@ -237,7 +237,7 @@ fn test_q06_180s() {
     ).expect("load 0.6B");
     let t0 = std::time::Instant::now();
     let result = engine.transcribe(
-        &fixture("180s.wav"),
+        &fixture("180s_zh.wav"),
         qwen3_asr::TranscribeOptions::default().with_max_new_tokens(1024),
     ).expect("transcribe");
     let elapsed = t0.elapsed().as_secs_f32();
@@ -277,7 +277,7 @@ fn test_q17_90s() {
     ).expect("load 1.7B");
     let t0 = std::time::Instant::now();
     let result = engine.transcribe(
-        &fixture("90s.wav"),
+        &fixture("90s_en.wav"),
         qwen3_asr::TranscribeOptions::default().with_max_new_tokens(1024),
     ).expect("transcribe");
     let elapsed = t0.elapsed().as_secs_f32();
@@ -297,7 +297,7 @@ fn test_q17_180s() {
     ).expect("load 1.7B");
     let t0 = std::time::Instant::now();
     let result = engine.transcribe(
-        &fixture("180s.wav"),
+        &fixture("180s_zh.wav"),
         qwen3_asr::TranscribeOptions::default().with_max_new_tokens(1024),
     ).expect("transcribe");
     let elapsed = t0.elapsed().as_secs_f32();
@@ -338,7 +338,7 @@ fn test_cuda_streaming_visual_90s() {
         std::path::Path::new(&model_dir_06()), backend,
     ).expect("load 0.6B");
 
-    let wav = fixture("90s.wav");
+    let wav = fixture("90s_en.wav");
     let options = qwen3_asr::TranscribeOptions::default();
 
     println!("\n═══ CUDA Streaming 90s English (typewriter) ═══\n");
