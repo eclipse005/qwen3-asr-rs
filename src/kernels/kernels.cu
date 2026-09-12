@@ -8,6 +8,56 @@
 #define INFINITY __int_as_float(0x7f800000)
 #endif
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  Block-wide reductions
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Every block reduction that needs a shared scratch array goes through these helpers.
+// Do not hand-roll another reduction loop.
+//
+// Background (ROADMAP §1.4.2): the hand-rolled loops used to store into one shared
+// scratch array and then store into the *same* array again for a second reduction
+// (a max followed by a sum, as in softmax / attention).  Nothing forced a barrier
+// between the first reduction's `buf[0]` read and the second reduction's `buf[tid]`
+// store, so a warp that had not yet read `buf[0]` could observe another warp's
+// freshly written value.  That cross-warp race made long-context attention
+// non-deterministic: 180 s audio produced a different transcript on every run.
+//
+// These helpers make the class unrepresentable:
+//   * each logical reduction takes its OWN scratch array (a caller-owned __shared__
+//     array or a slice of dynamic shared memory), and
+//   * the helper ends with a barrier that *releases* the array, so even accidental
+//     reuse of one array is safe.
+//
+// The reduction tree is identical to the original hand-rolled loops (`s` halving from
+// `bs / 2`, no warp intrinsics), so results stay bit-identical.
+//
+// Contract: `buf` holds at least `bs` floats; `bs` is a multiple of 32; and every
+// thread of the block reaches the call (the helpers contain barriers).
+__device__ __forceinline__ float block_reduce_max(float v, float* buf, int bs, int tid) {
+    buf[tid] = v;
+    __syncthreads();
+    for (int s = bs >> 1; s > 0; s >>= 1) {
+        if (tid < s) buf[tid] = fmaxf(buf[tid], buf[tid + s]);
+        __syncthreads();
+    }
+    const float r = buf[0];
+    __syncthreads();   // release `buf`
+    return r;
+}
+
+__device__ __forceinline__ float block_reduce_sum(float v, float* buf, int bs, int tid) {
+    buf[tid] = v;
+    __syncthreads();
+    for (int s = bs >> 1; s > 0; s >>= 1) {
+        if (tid < s) buf[tid] += buf[tid + s];
+        __syncthreads();
+    }
+    const float r = buf[0];
+    __syncthreads();   // release `buf`
+    return r;
+}
+
 // ─── RMS norm: x [outer, last] * weight[last] → out, with f32 accumulation ──
 // One block per row; block_size threads cooperate over `last`.
 // Uses __half2 vectorized loads for 2x memory throughput.
@@ -220,7 +270,10 @@ softmax_scaled_causal_f16(
     int m_idx = row % m;
     int valid_n = (is_causal != 0) ? (m_idx + 1) : n;
 
-    extern __shared__ float sdata[];
+    // Two independent reductions -> two scratch arrays (dynamic shared is 2 * bs floats).
+    // See the block-reduction contract at the top of this file.
+    extern __shared__ float sdata[];   // [0, bs) max, [bs, 2*bs) sum
+    float* sum_buf = sdata + bs;
 
     // Max
     float local_max = -INFINITY;
@@ -228,27 +281,14 @@ softmax_scaled_causal_f16(
         float v = __half2float(x[row * n + j]) * scale;
         if (v > local_max) local_max = v;
     }
-    sdata[tid] = local_max;
-    __syncthreads();
-    for (int s = bs >> 1; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
-        __syncthreads();
-    }
-    float row_max = sdata[0];
-    __syncthreads();
+    const float row_max = block_reduce_max(local_max, sdata, bs, tid);
 
     // Sum
     float local_sum = 0.0f;
     for (int j = tid; j < valid_n; j += bs) {
         local_sum += expf(__half2float(x[row * n + j]) * scale - row_max);
     }
-    sdata[tid] = local_sum;
-    __syncthreads();
-    for (int s = bs >> 1; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
-        __syncthreads();
-    }
-    float inv_sum = 1.0f / sdata[0];
+    const float inv_sum = 1.0f / block_reduce_sum(local_sum, sum_buf, bs, tid);
 
     for (int j = tid; j < n; j += bs) {
         if (j < valid_n) {
@@ -877,8 +917,16 @@ fused_gqa_decode_f16(
     int tid = threadIdx.x;
     int bs = blockDim.x;
 
-    extern __shared__ float smem[];   // scores[cur_len], then partial_out[d * t_chunks]
+    int t_chunks = bs / d;
+    if (t_chunks < 1) t_chunks = 1;
+
+    // Shared layout: scores[cur_len] | partial[d*t_chunks] | red_max[bs] | red_sum[bs].
+    // The two reductions get separate scratch arrays — this kernel used to share one,
+    // which is the bug class described at the top of this file.
+    extern __shared__ float smem[];
     float* partial = smem + cur_len;
+    float* red_max = partial + d * t_chunks;
+    float* red_sum = red_max + bs;
 
     const __half* q_row  = q       + (ib * nqh  + qh) * d;
     const __half* k_base = k_cache + (ib * nkvh + kh) * max_seq * d;
@@ -903,14 +951,7 @@ fused_gqa_decode_f16(
     for (int t = tid; t < cur_len; t += bs) {
         if (smem[t] > local_max) local_max = smem[t];
     }
-    __shared__ float reduce_buf[1024];
-    reduce_buf[tid] = local_max;
-    __syncthreads();
-    for (int s = bs >> 1; s > 0; s >>= 1) {
-        if (tid < s) reduce_buf[tid] = fmaxf(reduce_buf[tid], reduce_buf[tid + s]);
-        __syncthreads();
-    }
-    float row_max = reduce_buf[0];
+    const float row_max = block_reduce_max(local_max, red_max, bs, tid);
 
     // --- Stage 3: smem[t] = exp(smem[t] - row_max); sum-reduce ---
     float local_sum = 0.0f;
@@ -919,19 +960,11 @@ fused_gqa_decode_f16(
         smem[t] = v;
         local_sum += v;
     }
-    reduce_buf[tid] = local_sum;
-    __syncthreads();
-    for (int s = bs >> 1; s > 0; s >>= 1) {
-        if (tid < s) reduce_buf[tid] += reduce_buf[tid + s];
-        __syncthreads();
-    }
-    float inv_sum = 1.0f / reduce_buf[0];
+    const float inv_sum = 1.0f / block_reduce_sum(local_sum, red_sum, bs, tid);
 
     // --- Stage 4: out[j] = sum_t attn[t] * V[t, j]
     // Reuse the original t-split layout: tid = t_idx * d + j_idx (2 t-chunks for bs=256, d=128).
     // Each thread sums a t-stride for one j, then we reduce in shared mem.
-    int t_chunks = bs / d;
-    if (t_chunks < 1) t_chunks = 1;
     int j_idx = tid % d;
     int t_idx = tid / d;
     if (j_idx < d && t_idx < t_chunks) {
@@ -993,8 +1026,18 @@ fused_gqa_decode_split_p1_f16(
     }
     int chunk_len = t_end - t_start;
 
-    extern __shared__ float smem[];   // scores[chunk_size]
+    // Shared layout: scores[chunk_size] | partial[d*t_split] | red_max[bs] | red_sum[bs].
+    // The two reductions get separate scratch arrays — see the block-reduction contract
+    // at the top of this file.
+    extern __shared__ float smem[];
     __shared__ __half q_smem[128];    // d=128, Q cached in shared mem (256 bytes)
+
+    // Stage-4 t-stride split (d=128, bs=256 -> 2).
+    int t_split = bs / d;
+    if (t_split < 1) t_split = 1;
+    float* partial = smem + chunk_size;
+    float* red_max = partial + d * t_split;
+    float* red_sum = red_max + bs;
 
     const __half* q_row  = q       + (ib * nqh  + qh) * d;
     const __half* k_base = k_cache + (ib * nkvh + kh) * max_seq * d + t_start * d;
@@ -1022,14 +1065,7 @@ fused_gqa_decode_split_p1_f16(
     for (int t = tid; t < chunk_len; t += bs) {
         if (smem[t] > local_max) local_max = smem[t];
     }
-    __shared__ float reduce_buf[256];
-    reduce_buf[tid] = local_max;
-    __syncthreads();
-    for (int s = bs >> 1; s > 0; s >>= 1) {
-        if (tid < s) reduce_buf[tid] = fmaxf(reduce_buf[tid], reduce_buf[tid + s]);
-        __syncthreads();
-    }
-    float chunk_max = reduce_buf[0];
+    const float chunk_max = block_reduce_max(local_max, red_max, bs, tid);
 
     // Stage 3: exp + sum
     float local_sum = 0.0f;
@@ -1038,22 +1074,11 @@ fused_gqa_decode_split_p1_f16(
         smem[t] = v;
         local_sum += v;
     }
-    reduce_buf[tid] = local_sum;
-    __syncthreads();
-    for (int s = bs >> 1; s > 0; s >>= 1) {
-        if (tid < s) reduce_buf[tid] += reduce_buf[tid + s];
-        __syncthreads();
-    }
-    float chunk_sum = reduce_buf[0];
+    const float chunk_sum = block_reduce_sum(local_sum, red_sum, bs, tid);
 
     // Stage 4: partial out (NOT normalized — we let phase 2 do that with merged sum)
-    // Use t-chunks layout for d=128, bs=256 → t_chunks=2.
-    int t_split = bs / d;
-    if (t_split < 1) t_split = 1;
     int j_idx = tid % d;
     int t_idx = tid / d;
-    // Shared partial buffer at smem[chunk_size..].
-    float* partial = smem + chunk_size;
     if (j_idx < d && t_idx < t_split) {
         float acc = 0.0f;
         for (int t = t_idx; t < chunk_len; t += t_split) {
@@ -1263,5 +1288,76 @@ add_pe_f16(
     for (int j = tid; j < d; j += bs) {
         float v = __half2float(x[row * d + j]) + __half2float(pe[t_step * d + j]);
         out[row * d + j] = __float2half(v);
+    }
+}
+
+// ─── Dense f16 GEMV (m = 1):  y[n] = sum_k W[n,k] * x[k]   (or  y += W.x) ─────
+//
+// Used for every decode-step projection (qkv / o_proj / gate_up / down / lm_head).
+// Decode is purely DRAM-bandwidth bound — each generated token streams the whole
+// weight matrix once — and on Pascal cuBLAS's n=1 GEMM kernel selection lands well
+// short of peak (measured 87-213 GB/s vs 293 GB/s achievable on P104-100).  This
+// kernel exists to actually reach bandwidth: one warp per output row, lane-strided
+// uint4 (8 halves = 16 B) loads on BOTH the weight row and the activation vector, so
+// every warp load is a contiguous 512 B run.  Four independent f32 accumulators keep
+// the FMA chain short.  f16 storage, f32 accumulate.  Verified bit-identical to
+// cuBLAS on the real shapes (0 of 151936 outputs differ), so the decode transcript
+// cannot shift because of this kernel.
+//
+// `accum != 0` fuses the residual add (the cuBLAS beta=1 case) into the epilogue.
+//
+// Grid: (ceil(rows / warps_per_block), 1, 1).  Block: 256 threads = 8 warps.
+// Requires cols >= 8; the tail (cols % 8) is handled by the first `cols % 8` lanes.
+extern "C" __global__ void __launch_bounds__(256, 4)
+gemv_f16(
+    __half* __restrict__ y,
+    const __half* __restrict__ x,
+    const __half* __restrict__ w,
+    int rows,
+    int cols,
+    int accum
+) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row  = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (row >= rows) return;   // whole warp shares `row`, so no divergent shuffle
+
+    const uint4* __restrict__ w4 = (const uint4*)(w + (size_t)row * (size_t)cols);
+    const uint4* __restrict__ x4 = (const uint4*)x;
+    const int n8 = cols >> 3;   // 8-half granules per row
+
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (int i = lane; i < n8; i += 32) {
+        uint4 wv = w4[i];
+        uint4 xv = x4[i];
+        float2 w0 = __half22float2(*reinterpret_cast<const __half2*>(&wv.x));
+        float2 w1 = __half22float2(*reinterpret_cast<const __half2*>(&wv.y));
+        float2 w2 = __half22float2(*reinterpret_cast<const __half2*>(&wv.z));
+        float2 w3 = __half22float2(*reinterpret_cast<const __half2*>(&wv.w));
+        float2 x0 = __half22float2(*reinterpret_cast<const __half2*>(&xv.x));
+        float2 x1 = __half22float2(*reinterpret_cast<const __half2*>(&xv.y));
+        float2 x2 = __half22float2(*reinterpret_cast<const __half2*>(&xv.z));
+        float2 x3 = __half22float2(*reinterpret_cast<const __half2*>(&xv.w));
+        acc0 = fmaf(w0.x, x0.x, fmaf(w0.y, x0.y, acc0));
+        acc1 = fmaf(w1.x, x1.x, fmaf(w1.y, x1.y, acc1));
+        acc2 = fmaf(w2.x, x2.x, fmaf(w2.y, x2.y, acc2));
+        acc3 = fmaf(w3.x, x3.x, fmaf(w3.y, x3.y, acc3));
+    }
+    float acc = (acc0 + acc1) + (acc2 + acc3);
+
+    const int rem = cols & 7;
+    if (rem != 0 && lane < rem) {
+        const int idx = (n8 << 3) + lane;
+        acc += __half2float(w[(size_t)row * (size_t)cols + idx]) * __half2float(x[idx]);
+    }
+
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_xor_sync(0xffffffffu, acc, off);
+    }
+
+    if (lane == 0) {
+        if (accum != 0) acc += __half2float(y[row]);
+        y[row] = __float2half(acc);
     }
 }

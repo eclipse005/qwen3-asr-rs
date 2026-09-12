@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use cudarc::cublas::safe::{CudaBlas, Gemm, GemmConfig};
 use cudarc::cublas::sys;
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DriverError};
+use cudarc::driver::{CudaContext, CudaSlice};
 use half::f16;
 use safetensors::SafeTensors;
 

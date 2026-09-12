@@ -104,6 +104,7 @@ pub(crate) struct CudaKernels {
     pub fused_gqa_decode_split_p2: CudaFunction,
     pub permute_bcft_to_btcf: CudaFunction,
     pub add_pe: CudaFunction,
+    pub gemv_f16: CudaFunction,
 }
 
 pub(crate) struct CudaState {
@@ -180,6 +181,7 @@ impl CudaState {
             fused_gqa_decode_split_p2: module.load_function("fused_gqa_decode_split_p2_f16")?,
             permute_bcft_to_btcf: module.load_function("permute_bcft_to_btcf_f16")?,
             add_pe: module.load_function("add_pe_f16")?,
+            gemv_f16: module.load_function("gemv_f16")?,
         };
 
         Ok(Self { ctx: ctx.clone(), stream, blas, k })
@@ -284,6 +286,48 @@ impl CudaState {
             )?;
         }
         Ok(())
+    }
+
+    /// Decode-step GEMV (m = 1): `y = Wᵀx`, or `y += Wᵀx` when `accum`.
+    ///
+    /// Hand-written stand-in for the cuBLAS n=1 GEMM.  Decode is purely DRAM-bandwidth
+    /// bound — every generated token streams the whole weight matrix once — and on
+    /// Pascal cuBLAS's n=1 kernel selection lands far short of achievable bandwidth
+    /// (measured 87-213 GB/s vs 293 GB/s on P104-100), so this is where decode time is
+    /// won.  `accum` fuses the residual add (the cuBLAS beta=1 case).  See `gemv_f16`
+    /// in kernels.cu.
+    pub fn linear_gemv_f16(&self, y: &mut CudaSlice<f16>, x: &CudaSlice<f16>, w: &GpuWeight, accum: bool) -> Result<()> {
+        let n = w.rows;
+        let k = w.cols;
+        assert_eq!(x.len(), k, "gemv K mismatch: x len={} vs W cols={}", x.len(), k);
+        assert_eq!(y.len(), n, "gemv N mismatch: y len={} vs W rows={}", y.len(), n);
+        const WARPS_PER_BLOCK: u32 = 8;
+        let cfg = LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(WARPS_PER_BLOCK), 1, 1),
+            block_dim: (WARPS_PER_BLOCK * 32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let accum_i: i32 = if accum { 1 } else { 0 };
+        let mut b = self.stream.launch_builder(&self.k.gemv_f16);
+        b.arg(y);
+        b.arg(x);
+        b.arg(&w.data);
+        b.arg(&n_i);
+        b.arg(&k_i);
+        b.arg(&accum_i);
+        unsafe { b.launch(cfg) }?;
+        Ok(())
+    }
+
+    /// Whether a projection should use the hand-written GEMV rather than cuBLAS.
+    ///
+    /// Only the m == 1 (decode) case: prefill has real GEMM shapes where cuBLAS is
+    /// far ahead.  The kernel needs at least one full 8-half granule.
+    #[inline]
+    fn use_gemv(m: usize, k: usize) -> bool {
+        m == 1 && k >= 8
     }
 
     /// scores = Q @ K^T  (Q: [b,h,m,d], K: [b,h,n,d] → [b,h,m,n])
@@ -449,7 +493,8 @@ impl CudaState {
         let cfg = LaunchConfig {
             grid_dim: (rows as u32, 1, 1),
             block_dim: (bs, 1, 1),
-            shared_mem_bytes: bs * 4,
+            // Two reductions (max, then sum) → two scratch arrays of `bs` floats each.
+            shared_mem_bytes: bs * 4 * 2,
         };
         let mut out = self.alloc_uninit_f16(scores.numel())?;
         let m_i = m as i32;
@@ -893,7 +938,9 @@ impl CudaState {
                       else { 256 };
         let t_chunks = (bs as usize / d).max(1);
         // shared: scores[cur_len] + partial_out[d * t_chunks], both f32.
-        let smem_bytes = (cur_len + d * t_chunks) * 4;
+        // scores | partial | red_max[bs] | red_sum[bs]  (see the block-reduction
+        // contract in kernels.cu: each logical reduction owns its own scratch array)
+        let smem_bytes = (cur_len + d * t_chunks + 2 * bs as usize) * 4;
         let cfg = LaunchConfig {
             grid_dim: ((b * nqh) as u32, 1, 1),
             block_dim: (bs, 1, 1),
@@ -929,7 +976,8 @@ impl CudaState {
         // Phase 1: per-chunk partial computation.
         let bs: u32 = 256;
         let t_split = (bs as usize / d).max(1);
-        let smem_bytes = (chunk_size + d * t_split) * 4;
+        // scores | partial | red_max[bs] | red_sum[bs]  (two reductions, two arrays)
+        let smem_bytes = (chunk_size + d * t_split + 2 * bs as usize) * 4;
         let mut part_out_buf = part_out;
         let mut part_max_buf = part_max;
         let mut part_sum_buf = part_sum;
@@ -1151,6 +1199,9 @@ impl CudaState {
     pub fn linear_gpu_into_flat(&self, x: &CudaSlice<f16>, m: usize, k: usize, w: &GpuWeight, out: &mut CudaSlice<f16>) -> Result<()> {
         let n = w.rows;
         assert_eq!(k, w.cols);
+        if Self::use_gemv(m, k) {
+            return self.linear_gemv_f16(out, x, w, false);
+        }
         unsafe {
             self.blas.gemm(
                 GemmConfig {
@@ -1221,7 +1272,9 @@ impl CudaState {
                       else if cur_len > 512 { 512 }
                       else { 256 };
         let t_chunks = (bs as usize / d).max(1);
-        let smem_bytes = (cur_len + d * t_chunks) * 4;
+        // scores | partial | red_max[bs] | red_sum[bs]  (see the block-reduction
+        // contract in kernels.cu: each logical reduction owns its own scratch array)
+        let smem_bytes = (cur_len + d * t_chunks + 2 * bs as usize) * 4;
         let cfg = LaunchConfig {
             grid_dim: ((b * nqh) as u32, 1, 1),
             block_dim: (bs, 1, 1),
@@ -1254,7 +1307,8 @@ impl CudaState {
         let d = 128usize;
         let bs: u32 = 256;
         let t_split = (bs as usize / d).max(1);
-        let smem_bytes = (chunk_size + d * t_split) * 4;
+        // scores | partial | red_max[bs] | red_sum[bs]  (two reductions, two arrays)
+        let smem_bytes = (chunk_size + d * t_split + 2 * bs as usize) * 4;
         {
             let cfg = LaunchConfig {
                 grid_dim: (nqh as u32, n_chunks as u32, 1),
@@ -1303,6 +1357,9 @@ impl CudaState {
     pub fn linear_gpu_accum_slice(&self, y: &mut CudaSlice<f16>, x: &CudaSlice<f16>, w: &GpuWeight) -> Result<()> {
         let k = w.cols;
         let n = w.rows;
+        if Self::use_gemv(1, k) {
+            return self.linear_gemv_f16(y, x, w, true);
+        }
         unsafe {
             self.blas.gemm(
                 GemmConfig {
@@ -1625,3 +1682,200 @@ pub(crate) fn compute_mrope_cos_sin(
     let sin = CpuTensor::new(sv.iter().map(|&v| f16::from_f32(v)).collect(), vec![sl, hd]);
     (cos, sin)
 }
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Decode GEMV benchmark: hand-written kernel vs cuBLAS
+// ═══════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod gemv_bench {
+    use super::*;
+    use std::time::Instant;
+
+    /// Deterministic f16 weights in [0.5, 1.0) — no denormals/NaN, and incompressible
+    /// enough that DRAM traffic is honest.
+    fn make_weight(cuda: &CudaState, rows: usize, cols: usize) -> GpuWeight {
+        let mut s: u32 = 12345;
+        let data: Vec<f16> = (0..rows * cols)
+            .map(|_| {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                f16::from_f32(0.5 + ((s >> 8) as f32 / 16777216.0) * 0.5)
+            })
+            .collect();
+        GpuWeight { data: cuda.upload_f16(&data).expect("upload weight"), rows, cols }
+    }
+
+    #[test]
+    #[ignore]
+    fn gemv_vs_cublas_bandwidth() {
+        let cuda = match CudaState::new(0) {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                eprintln!("skip GEMV bench (no CUDA device): {e:?}");
+                return;
+            }
+        };
+
+        // The five decode-step projections, 0.6B shapes.
+        let shapes: [(&str, usize, usize); 5] = [
+            ("qkv", 4096, 1024),
+            ("o_proj", 1024, 2048),
+            ("gate_up", 6144, 1024),
+            ("down_proj", 1024, 3072),
+            ("lm_head", 151936, 1024),
+        ];
+
+        println!("{:<11} {:>10} {:>11} {:>11} {:>9}", "gemv", "weight(MB)", "cuBLAS GB/s", "kernel GB/s", "speedup");
+        println!("{}", "-".repeat(56));
+
+        let iters = 50usize;
+        let mut cb_total = 0.0f64;
+        let mut k_total = 0.0f64;
+        let mut bytes_total = 0usize;
+
+        for (name, rows, cols) in shapes {
+            let w = make_weight(&cuda, rows, cols);
+            let x = cuda.upload_f16(&vec![f16::from_f32(0.75); cols]).expect("x");
+            let mut y = cuda.alloc_uninit_f16(rows).expect("y");
+            let bytes = rows * cols * 2;
+
+            // ── cuBLAS ──
+            let cfg = GemmConfig {
+                transa: sys::cublasOperation_t::CUBLAS_OP_T,
+                transb: sys::cublasOperation_t::CUBLAS_OP_N,
+                m: rows as i32, n: 1, k: cols as i32,
+                alpha: f16::from_f32(1.0),
+                lda: cols as i32, ldb: cols as i32,
+                beta: f16::from_f32(0.0), ldc: rows as i32,
+            };
+            for _ in 0..3 { unsafe { cuda.blas.gemm(cfg, &w.data, &x, &mut y).expect("warm") }; }
+            cuda.synchronize().expect("sync");
+            let t0 = Instant::now();
+            for _ in 0..iters { unsafe { cuda.blas.gemm(cfg, &w.data, &x, &mut y).expect("blas") }; }
+            cuda.synchronize().expect("sync");
+            let cb_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+            // ── hand-written kernel ──
+            for _ in 0..3 { cuda.linear_gemv_f16(&mut y, &x, &w, false).expect("warm"); }
+            cuda.synchronize().expect("sync");
+            let t0 = Instant::now();
+            for _ in 0..iters { cuda.linear_gemv_f16(&mut y, &x, &w, false).expect("gemv"); }
+            cuda.synchronize().expect("sync");
+            let k_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+            let cb_bw = bytes as f64 / 1e9 / (cb_ms / 1000.0);
+            let k_bw = bytes as f64 / 1e9 / (k_ms / 1000.0);
+            println!("{:<11} {:>10.1} {:>11.1} {:>11.1} {:>8.2}x",
+                name, bytes as f64 / 1048576.0, cb_bw, k_bw, k_bw / cb_bw);
+
+            cb_total += cb_ms;
+            k_total += k_ms;
+            bytes_total += bytes;
+        }
+
+        println!("{}", "-".repeat(56));
+        println!("one layer's 4 GEMVs + lm_head:");
+        println!("  cuBLAS   {:>8.3} ms  ({:.1} GB/s)", cb_total, bytes_total as f64 / 1e9 / (cb_total / 1000.0));
+        println!("  kernel   {:>8.3} ms  ({:.1} GB/s)", k_total, bytes_total as f64 / 1e9 / (k_total / 1000.0));
+        println!("  speedup  {:>8.2}x", cb_total / k_total);
+    }
+
+    /// Per-launch cost on this driver: 1000 launches of a trivial kernel whose actual
+    /// work is ~14 ns.  Decode issues ~255 kernels per token, so this is the floor of
+    /// the non-GEMV overhead.
+    #[test]
+    #[ignore]
+    fn launch_overhead() {
+        let cuda = match CudaState::new(0) {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                eprintln!("skip launch bench (no CUDA device): {e:?}");
+                return;
+            }
+        };
+
+        // add_f16 on 1024 elements = 4 KB of traffic ≈ 14 ns of work.
+        let a = cuda.alloc_uninit_f16(1024).expect("a");
+        let b = cuda.alloc_uninit_f16(1024).expect("b");
+        let o = cuda.alloc_uninit_f16(1024).expect("o");
+        let n: i32 = 1024;
+        let cfg = LaunchConfig::for_num_elems(1024);
+
+        let launch = || {
+            let mut bb = cuda.stream.launch_builder(&cuda.k.add);
+            bb.arg(&a);
+            bb.arg(&b);
+            bb.arg(&o);
+            bb.arg(&n);
+            unsafe { bb.launch(cfg) }.expect("launch");
+        };
+
+        for _ in 0..20 { launch(); }
+        cuda.synchronize().expect("sync");
+
+        let iters = 1000usize;
+        let t0 = Instant::now();
+        for _ in 0..iters { launch(); }
+        cuda.synchronize().expect("sync");
+        let ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        println!("launch overhead: {:.2} us/launch  (async enqueue)", ms * 1000.0);
+        println!("  -> 255 launches/token ≈ {:.2} ms", ms * 255.0);
+        println!("  -> 142 non-GEMV launches ≈ {:.2} ms", ms * 142.0);
+    }
+
+    /// Bit-level comparison of the hand-written GEMV against cuBLAS on the same weights.
+    /// Different summation orders give different f32 partial sums; the question that
+    /// matters is whether that survives the f16 rounding of the output — if it does, the
+    /// decode transcript cannot shift because of the GEMV.
+    #[test]
+    #[ignore]
+    fn gemv_bitwise_vs_cublas() {
+        let cuda = match CudaState::new(0) {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                eprintln!("skip bitwise bench (no CUDA device): {e:?}");
+                return;
+            }
+        };
+
+        for (name, rows, cols) in [("qkv", 4096usize, 1024usize), ("o_proj", 1024, 2048), ("lm_head", 151936, 1024)] {
+            let w = make_weight(&cuda, rows, cols);
+            let x = cuda.upload_f16(&vec![f16::from_f32(0.75); cols]).expect("x");
+            let mut y_blas = cuda.alloc_uninit_f16(rows).expect("y_blas");
+            let mut y_gemv = cuda.alloc_uninit_f16(rows).expect("y_gemv");
+
+            unsafe {
+                cuda.blas.gemm(
+                    GemmConfig {
+                        transa: sys::cublasOperation_t::CUBLAS_OP_T,
+                        transb: sys::cublasOperation_t::CUBLAS_OP_N,
+                        m: rows as i32, n: 1, k: cols as i32,
+                        alpha: f16::from_f32(1.0),
+                        lda: cols as i32, ldb: cols as i32,
+                        beta: f16::from_f32(0.0), ldc: rows as i32,
+                    },
+                    &w.data, &x, &mut y_blas,
+                ).expect("blas");
+            }
+            cuda.linear_gemv_f16(&mut y_gemv, &x, &w, false).expect("gemv");
+            cuda.synchronize().expect("sync");
+
+            let a = cuda.download_f16(&y_blas).expect("dl a");
+            let b = cuda.download_f16(&y_gemv).expect("dl b");
+            let mut diff = 0usize;
+            let mut max_rel = 0.0f32;
+            for i in 0..rows {
+                let (av, bv) = (a[i].to_f32(), b[i].to_f32());
+                if a[i].to_bits() != b[i].to_bits() { diff += 1; }
+                if av.abs() > 1e-6 {
+                    max_rel = max_rel.max((av - bv).abs() / av.abs());
+                }
+            }
+            println!("{:<9} {:>7} rows | differing outputs: {:>6} ({:.4}%) | max rel diff {:.2e}",
+                name, rows, diff, 100.0 * diff as f64 / rows as f64, max_rel);
+        }
+    }
+}
+
