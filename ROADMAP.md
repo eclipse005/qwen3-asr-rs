@@ -115,6 +115,103 @@ hub  = ["dep:reqwest"]
 
 **跨架构可移植（强卡更强，已具备）**：① cuBLAS GEMM 设了 `CUBLAS_TENSOR_OP_MATH`（cudarc_engine.rs:133）→ 在 tensor-core 卡（Volta+，如 RTX 3080 sm_86）自动用 TC，Pascal 走非-TC。② NVRTC kernel 运行时按当前卡 `sm_{major}{minor}` 编译（cudarc_engine.rs:141）→ 不写死 sm_61。所以**无需为 3080 改代码**，直接打包即可，RTFx 会显著高于 P104。唯一 P104 经验旋钮：attention chunk 256/512（cudarc_engine.rs:1381），3080 上 SM 更多可能要重调。
 
+### 1.4.1 手写 GEMV 替换 cuBLAS 解码投影（2026-09-12）
+
+decode 的 5 个投影（qkv / o_proj / gate_up / down / lm_head）原本全部走 cuBLAS GEMM（m=1）。decode 是纯带宽受限——每生成一个 token 要把 1.14 GB 权重完整扫一遍（28 层 × 30 MB + lm_head 297 MB）——而 cuBLAS 在 n=1 形状上的 kernel 选择远达不到可用带宽。
+
+新增 `gemv_f16`（kernels.cu）：**一个 warp 负责一行输出**，权重行与激活向量都用 `uint4`（16 B = 8 个 half）lane-stride 读取，因此每次 warp 访存是连续 512 B；4 个独立 f32 累加器缩短 FMA 依赖链；`accum != 0` 把残差加（原 cuBLAS beta=1）融进 epilogue。
+
+**kernel 级带宽（`cargo test --release --lib gemv_bench -- --ignored --nocapture --test-threads=1`）**
+
+| GEMV | 权重 | cuBLAS | 手写 kernel | 倍率 |
+|---|---|---|---|---|
+| qkv 4096×1024 | 8.0 MB | 177 GB/s | **240 GB/s** | 1.35× |
+| o_proj 1024×2048 | 4.0 MB | 129 | **200** | 1.55× |
+| gate_up 6144×1024 | 12.0 MB | 187 | **253** | 1.35× |
+| down_proj 1024×3072 | 6.0 MB | 135 | **222** | 1.65× |
+| lm_head 151936×1024 | 296.8 MB | 215 | **296** | 1.38× |
+| **合计（一 token 的 5 个）** | 326.8 MB | 1.644 ms / 208 GB/s | **1.186 ms / 289 GB/s** | **1.39×** |
+
+**端到端（P104-100；A/B 两轮交叉，取均值）**
+
+"优化前" = HEAD 原版（cuBLAS GEMV + 原始 PTX）；"优化后" = 手写 GEMV + 竞态修复。
+
+| 模型 | 音频 | 优化前 RTFx | 优化后 RTFx | 提升 | 优化前 vs 基线 | 优化后 vs 基线 |
+|---|---|---|---|---|---|---|
+| 0.6B | 15s 英文 | 25.5× | **30.4×** | 1.19× | 一致 | 一致 |
+| 0.6B | 30s 中文 | 17.0× | **21.6×** | 1.27× | 一致 | 一致 |
+| 0.6B | 90s 英文 | 19.9× | **23.4×** | 1.18× | 一致 | 一致 |
+| 0.6B | 89s 日文 | 18.4× | **22.0×** | 1.19× | 一致 | 一致 |
+| 0.6B | 180s 英文 | 15.8× | **18.1×** | 1.14× | 不一致（幻觉 "PP."） | 一致 |
+| 0.6B | 180s 中文 | 14.7× | **16.8×** | 1.14× | 不一致 | 一致 |
+| 1.7B | 15s 英文 | 9.3× | **12.4×** | 1.33× | 单次看似一致、实为不稳定 | 一致 |
+| 1.7B | 30s 中文 | 8.3× | **11.0×** | 1.33× | 同上 | 一致 |
+| 1.7B | 90s 英文 | 8.9× | **11.5×** | 1.29× | 同上 | 一致 |
+| 1.7B | 89s 日文 | 10.4× | **13.2×** | 1.27× | 同上 | 一致 |
+| 1.7B | 180s 英文 | 8.9× | **11.0×** | 1.24× | 同上 | 一致 |
+| 1.7B | 180s 中文 | 8.3× | **10.3×** | 1.24× | 同上 | 一致 |
+
+**1.7B 的提升更大（1.24-1.33× vs 1.14-1.27×）**：1.7B 每 token 要扫 3.44 GB 权重（0.6B 为 1.19 GB，2.9×），decode 占比更高，而 GEMV 正是 decode 的瓶颈。
+
+**可复现性（优化前 vs 优化后）** —— 这是原版的一个真 bug，详见 §1.4.2：
+
+| 组合 | 优化前，同二进制连跑 3 次 | 优化后，同二进制连跑 3 次 |
+|---|---|---|
+| 0.6B 180s_zh | **3 个不同 hash** | 3/3 相同 |
+| 1.7B 180s_zh | **2 个不同 hash** | 3/3 相同 |
+| 其余 fixture（两模型） | 稳定 | 稳定 |
+
+进程内计时（0.6B / 15s）：decode 8.58 → 6.58 ms/tok（**1.30×**），prefill 67.9 ms 不变。整 token 的 GEMV 从 6.59 ms 降到 4.58 ms（省 2.01 ms），与实测 decode 省下的 2.00 ms 吻合——**说明 decode 的收益 100% 来自 GEMV**。
+
+prefill（m>1）仍走 cuBLAS：那里是真正的大 GEMM，cuBLAS 领先太多（实测 cuBLAS f16 GEMM 4.0-5.2 TFLOP/s，手写 WGSL 版只有 1.0，见 `wgpu/FEASIBILITY.md`）。
+
+**解码剩余开销分解**：255 次 kernel launch × 5.77 µs = **1.47 ms/token**（占 6.58 ms 的 22%）。这是下一个可动的目标（CUDA Graph 或进一步融合），但当前收益已收口。
+
+**数值一致性**：`cargo run --release --example verify_baseline -- cuda all` 对 0.6B / 1.7B 两个模型 × 6 个 fixture = **12 项逐字比对**。基线已于 2026-09-12 用含竞态修复的正确版本重新冻结（见 §1.4.2），当前 **12/12 逐字一致**。
+
+两条独立的正确性证据：
+
+- 手写 `gemv_f16` 与 cuBLAS 在同一权重上输出**逐位相同**（151936/151936，见 `gemv_bench::gemv_bitwise_vs_cublas`）；
+- 除 0.6B/180s_zh 外，其余 11 项基线文本与改动前**逐字未变**；180s_zh 的变化只有一处标点（`呀，` → `呀？`，相似度 99.89%），而该 fixture 正是原版竞态下跨 run 不可复现的那个 case。
+
+### 1.4.2 [已修] block reduction 的共享缓冲区复用竞态（2026-09-12）
+
+**症状**：180s 长音频的 CUDA 转录**跨 run 不可复现**。同一二进制、同一输入连跑 3 次得到 3 个不同的文本；短音频（15s/30s/90s）则完全稳定。
+
+**根因（两处，同一模式）**：kernel 里同一个 shared scratch 数组被**两次归约复用**（先求 max 再求 sum），而 `float x = buf[0];` 的读取与第二次归约的 `buf[tid] = ...` 写入之间**没有 barrier**。落在后面的 warp 可能读到别的 warp 刚写进去的 sum 而不是 max → 该 warp 的 exp/sum 全错。属跨 warp 竞态（UB）。
+
+- `fused_gqa_decode_split_p1_f16`（长上下文 split-K 路径）—— 触发长音频不可复现
+- `fused_gqa_decode_f16`（短上下文单 kernel 路径）—— 同样有缺陷，只是概率低，一直没被触发
+
+`softmax_scaled_causal_f16` 是同一模式但**有** barrier（历史上写对了），属于运气好。
+
+**修复方式（设计层，非打补丁）**：把 block reduction 收敛成两个 device helper
+（`block_reduce_max` / `block_reduce_sum`，见 kernels.cu 顶部 "Block-wide reductions" 一节），并明确 **每一个逻辑归约独占自己的 scratch 数组**：
+
+- helper 内部自带完整 barrier 纪律（store → barrier → 树形归约 → barrier → 读 `buf[0]` → **释放 barrier**）；
+- 结尾那个"释放 barrier"意味着**即使误用同一个数组也不会再出竞态** —— 该类缺陷在结构上不可表示；
+- 归约树与原手写循环逐字一致（`s` 从 `bs/2` 折半、不用 warp intrinsic），因此数值位精确。
+
+三个 kernel 改为各自持有独立 scratch（动态共享内存里切分）：
+`softmax` → `sdata` / `sdata+bs`；`fused_gqa_decode` → `red_max` / `red_sum`；`split_p1` → `red_max` / `red_sum`。
+host 侧对应的 `shared_mem_bytes` 已同步。
+
+**验证**：修复后 180s_zh 与 180s_en 各连跑 3 次，**3/3 完全一致**（修复前 180s_zh 为 3/3 互不相同）。
+全量基线校验恢复 5/6 逐字一致（唯一差异见下）。
+
+**定位手段（值得复用）**：① 把 `alloc_uninit_f16` 临时改成零填充 —— 非确定性依旧，排除"读未初始化内存"，确认是竞态；
+② 同一二进制多次跑 + md5 比对；③ `git stash push -- ptx src` 切回 HEAD 原版跑同一 fixture，用来判断分歧是本次改动引入的、还是本来就存在（本次据此证明 180s_zh 的标点差异与原版一致）。
+
+**⚠️ 一条反直觉的实测教训 —— 不要"顺手"重构单次归约**：
+最初把**所有** block reduction（包括 rms_norm / layer_norm / argmax 这些单次归约、本来无 bug 的）都统一到 helper。
+结果长音频转录的 6 个 fixture 里从 1 个不一致变成 **3 个不一致**。原因不是逻辑错误，而是 **codegen 扰动**：
+这些 kernel 每层都跑，换写法改变了 nvcc 的 FMA 收缩/调度，末位差异被 640-token 的自回归解码混沌放大。
+回退这些"卫生性"替换后立刻恢复 5/6。
+**结论：只对真正存在缺陷的地方做结构修复；单次归约的既有循环保持原样。**
+（反过来，手写 `gemv_f16` 与 cuBLAS 的输出经实测**逐位相同** —— 151936 个输出 0 个不同 —— 所以它不会扰动转录，见 §1.4.1。）
+
+**对基线的影响**：`docs/baseline/texts/` 里的长音频文本是在带竞态的 kernel 下生成的，属于随机结果的一个样本，**不能作为长音频的回归基准**。建议重生成。注意 180s_zh 的残留差异（`呀，` vs `呀？`）在修复前后的原版代码上都存在，与本次改动无关。
+
 ### 1.5 内存
 
 CPU 峰值 RSS 随音频长度分两段（INT8 默认；每 fixture 独立进程实测，Win32 PeakWorkingSet）：
@@ -253,6 +350,9 @@ kernel 存在（`lm_head_gemv_argmax_f16`）但注释说"目前输给 cuBLAS"，
 - [x] 脱离 burn 框架
 - [x] **修复 split-path attention 长上下文重复 bug**（2026-06-15，`2ef95b6`）：删除 `728d372` 误加的 `fused_gqa_decode_split_p1_f16` 上的 `__launch_bounds__(256,4)`。bisect 定位（`517c3e9` 好 → `728d372` 坏）；180s 文本恢复 640/582 token（崩前 465/282）。详见 §2.5。
 - [x] **mmap safetensors 加载**（2026-06-15，`c5a37cc`）：`weights.rs` 改 mmap + `Bytes::from_owner` 零拷贝 slice；`load_weights` 1111ms → 0.8ms，peak host mem ~3.6GB → ~1.8GB。bit-exact（15s/30s/180s 转录逐字一致）。详见 §2.1。
+- [x] **手写 GEMV 替换 cuBLAS 解码投影**（2026-09-12）：新增 `gemv_f16`（warp-per-row + uint4 双操作数读取 + f32 累加 + 残差加融合）。kernel 带宽 208 → 289 GB/s（1.39×），decode 8.58 → 6.58 ms/tok（1.30×），端到端 RTFx 1.21-1.31×。prefill 仍走 cuBLAS。转录逐字一致。详见 §1.4.1。
+- [x] **修复 block reduction 的共享缓冲区复用竞态**（2026-09-12，设计层）：新增 `block_reduce_max` / `block_reduce_sum` 两个 device helper（自带完整 barrier 纪律 + 返回前释放 scratch），并把三个"两次归约共用同一数组"的 kernel（`softmax` / `fused_gqa_decode` / `fused_gqa_decode_split_p1`）改为各自独占 scratch。该类缺陷结构上不可再表示。修复前 180s 长音频跨 run 不可复现（3 跑 3 个结果），修复后 3/3 一致。⚠️ 顺带实测：把**单次归约**的 kernel 也一并重构会因 codegen 扰动导致转录改变，已回退——详见 §1.4.2。
+- [x] **新增回归工具**：`examples/verify_baseline.rs`（全 fixture 逐字对照冻结基线，可选 `cuda|cpu` + wav 过滤）与 `src/cudarc_engine.rs::gemv_bench`（`#[ignore]` 单测，kernel 级 GEMV 带宽 vs cuBLAS + launch 开销）。
 
 ## 5. 下一步规划
 
@@ -481,6 +581,9 @@ Win32_AI_MachineLearning_DirectML
 3. 改前跑对应基线：
    CUDA: cargo test --release --test transcribe -- --ignored --nocapture --test-threads=1 test_q06_15s
    CPU:  cargo test --release --no-default-features --features cpu --test cpu_transcribe -- --nocapture --test-threads=1 test_cpu_15s
+   **动数值的改动（kernel 重写 / 融合 / 累加顺序）必跑**：`cargo run --release --example verify_baseline -- cuda`
+   —— 逐字对照全部 fixture；再连跑 2-3 次比对 md5，确认没有引入非确定性（§1.4.2 的教训）。
+   kernel 级性能：`cargo test --release --lib gemv_bench -- --ignored --nocapture --test-threads=1`
 4. 改完跑全量测试验证不退化
 5. 更新 ROADMAP 里的 RTFx 数字
 ```
