@@ -24,3 +24,11 @@
 # Keep language-tagged fixtures tracked (force-add historically; allowlist here).
 !tests/fixtures/*.wav
 asr_test_output.txt
+
+# wgpu port spike (standalone workspace + its cuBLAS reference crate)
+/wgpu/target
+/wgpu/cuda_ref/target
+
+# Local-only: agent working memory, pre-freeze baseline backups
+/.workbuddy
+/docs/baseline/texts.bak-*

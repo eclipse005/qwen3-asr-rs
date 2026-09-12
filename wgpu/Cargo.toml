@@ -1,0 +1,15 @@
+[workspace]
+
+[package]
+name = "qwen3-asr-wgpu-spike"
+version = "0.1.0"
+edition = "2021"
+description = "wgpu feasibility spike for qwen3-asr-rs: f16 GEMV bandwidth + dispatch overhead on the NVIDIA Vulkan backend"
+
+[dependencies]
+wgpu = "30.0.1"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+
+[profile.release]
+debug = false
